@@ -27,7 +27,10 @@ def detect_dead_ball(frame_features: domain.FrameFeatures, tagging: pd.DataFrame
                      graded_halves: list[domain.GradedHalf],
                      pipeline_config: config.PipelineConfig) -> domain.BoolPerFrame:
     is_dead = (frame_features.is_ball_out_of_pitch
-               | _detect_collective_stoppages(frame_features, pipeline_config))
+               | _detect_collective_stoppages(frame_features, pipeline_config)
+               | runs.drop_true_runs_shorter_than(
+                   ~frame_features.is_ball_tracked,
+                   pipeline_config.ball_gap_dead_min_duration_frames))
 
     set_pieces = tagging[tagging["code"] == "set pieces"]
     for tag_start_video_frame in set_pieces["start_video_frame"]:

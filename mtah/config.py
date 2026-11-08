@@ -36,6 +36,11 @@ class PipelineConfig:
     stoppage_min_duration_frames: int = _seconds_to_frames(2.0)
     # A visibly fast ball is in play regardless of how the players are moving.
     live_ball_min_speed_mps: float = 6.0
+    # The tracker mostly loses the ball when play stops (out of play, held for a restart). On the
+    # sample games, untracked-ball gaps of >= 2 s are 71-85% dead time, while gaps under 1 s are
+    # almost all live (brief occlusions). The challenge ATD shows the same stoppage signature
+    # (players slow on 47% of untracked frames vs 10% tracked). A gap this long counts as dead.
+    ball_gap_dead_min_duration_frames: int = _seconds_to_frames(2.0)
     # Clean-up: drop dead runs shorter than this; absorb live runs shorter than this between two
     # dead runs (a restart immediately followed by another stoppage is rare).
     dead_min_duration_frames: int = _seconds_to_frames(1.0)
