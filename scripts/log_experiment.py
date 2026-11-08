@@ -68,10 +68,12 @@ def _validation_columns(results_path: str) -> dict[str, object]:
 
 def _current_git_commit() -> str:
     """Suffixed with '+dirty' when there are uncommitted changes, so a row can never silently
-    point at code that differs from what produced it."""
+    point at code that differs from what produced it. The log files themselves are excluded:
+    they are always edited after the run they describe."""
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=_REPO_ROOT,
                             capture_output=True, text=True, check=True).stdout.strip()
-    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", ".",
+                             ":!experiments.csv", ":!ITERATIONS.md"],
                             cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
     return commit + ("+dirty" if status.strip() else "")
 
