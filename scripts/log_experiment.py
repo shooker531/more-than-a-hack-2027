@@ -7,8 +7,8 @@ Numbers are computed from the written submission and the config, never typed by 
 log in ITERATIONS.md can quote them without drifting from reality. Only aggregates are recorded:
 experiments.csv is safe to commit and to share.
 
-Validation columns stay empty until the external validation harness exists; from then on they
-are the numbers that decide whether an iteration is kept.
+Validation columns come from evaluation/reports/validation_latest.json, written by
+run_validation.py — run it first. They are the numbers that decide whether an iteration is kept.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from mtah import config, load, write  # noqa: E402
 
 _EXPERIMENTS_CSV = os.path.join(_REPO_ROOT, "experiments.csv")
 _DEFAULT_SUBMISSION = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
-_VALIDATION_COLUMNS = ["validation_games", "validation_spell_f1", "validation_macro_f1"]
+_VALIDATION_RESULTS = os.path.join(_REPO_ROOT, "evaluation", "reports", "validation_latest.json")
 
 
 def main(iteration: str, title: str, submission_path: str) -> None:
@@ -42,13 +42,28 @@ def main(iteration: str, title: str, submission_path: str) -> None:
         "title": title,
         "logged_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M"),
         "git_commit": _current_git_commit(),
-        **{column: "" for column in _VALIDATION_COLUMNS},
+        **_validation_columns(_VALIDATION_RESULTS),
         **{"full_match_" + name: round(value, 4) for name, value in full_match_summary.items()},
         "config_json": json.dumps(dataclasses.asdict(config.DEFAULT_CONFIG), sort_keys=True),
     }
     _append_row(_EXPERIMENTS_CSV, row)
     print("logged iteration {} to {}".format(iteration, os.path.relpath(_EXPERIMENTS_CSV,
                                                                         _REPO_ROOT)))
+
+
+def _validation_columns(results_path: str) -> dict[str, object]:
+    with open(results_path) as handle:
+        results = json.load(handle)
+    ours, official_baseline = results["pooled"]["pipeline"], results["pooled"]["baseline"]
+    return {
+        "validation_runs": "games {} x seeds {}".format(results["games"], results["seeds"]),
+        "validation_spell_f1": round(ours["spell_f1"], 4),
+        "validation_spell_f1_low": round(ours["spell_f1_low"], 4),
+        "validation_spell_f1_high": round(ours["spell_f1_high"], 4),
+        "validation_macro_f1": round(ours["macro_f1"], 4),
+        "validation_alive_dead_f1": round(ours["alive_dead_f1"], 4),
+        "validation_baseline_spell_f1": round(official_baseline["spell_f1"], 4),
+    }
 
 
 def _current_git_commit() -> str:

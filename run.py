@@ -3,7 +3,8 @@
     .venv/bin/python run.py                              # evaluation/results/mtah_mvp.csv
     .venv/bin/python run.py --output path/to/team.csv
 
-main() is the whole pipeline, one step per line, in order. Each step lives in its own mtah module.
+main() reads top to bottom: load inputs -> label (mtah/pipeline.py lists the processing steps)
+-> write -> validate -> report.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import os
 import sys
 
 import games
-from mtah import config, dead_ball, decode_rules, evidence, features, load, write
+from mtah import config, load, pipeline, write
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_OUTPUT_PATH = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
@@ -25,11 +26,7 @@ def main(output_path: str, pipeline_config: config.PipelineConfig) -> None:
     tagging = load.load_tagging(games.GAME, games.DATA_DIR)
     graded_halves = load.load_graded_halves(games.GAME)
 
-    frame_features = features.compute_frame_features(tracking, pipeline_config)
-    is_dead = dead_ball.detect_dead_ball(frame_features, tagging, graded_halves, pipeline_config)
-    control_evidence = evidence.detect_control_evidence(frame_features, pipeline_config)
-    labels = decode_rules.decode_possession_labels(control_evidence, is_dead, tagging,
-                                                   graded_halves, pipeline_config)
+    labels = pipeline.label_possessions(tracking, tagging, graded_halves, pipeline_config)
 
     write.write_submission_csv(output_path, labels)
     is_valid, validator_report = write.run_official_validator(output_path)
