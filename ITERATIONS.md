@@ -37,6 +37,37 @@ Entry template:
 
 ---
 
+## 002 — Sustained ball gaps count as dead ball  (2026-11-08)  ✅ KEPT
+
+**Why:** 001's notes — the tracker mostly loses the ball when play stops, and the MVP ignored
+that signal entirely.
+
+**Change:** `dead_ball.py` adds one signal: any untracked-ball gap of ≥ 2 s is dead
+(`ball_gap_dead_min_duration_frames`). On the sample games, gaps ≥ 2 s are 71–85% dead time while
+gaps < 1 s are almost all live.
+
+**Validation (3 games × 3 seeds, pooled):** spellF1 0.421 → **0.540** [0.525, 0.554], macroF1
+0.543 → 0.858, alive/dead F1 0.816 → 0.942 (now above the baseline's 0.917). Baseline 0.339.
+Threshold sweep was flat: 1 s 0.542, 2 s 0.540, 3 s 0.538, 4 s 0.537, 6 s 0.534 — so the gain is
+not riding on a fragile number.
+
+**Full-match sanity:** 350 possessions, mean 9.6 s (median 6.3 s), 56 under 2 s; D 47.2%,
+H 33.0%, A 19.8%.
+
+**Commit:** 84c8498
+
+**Notes:**
+- **D is now over-predicted.** Full match 47% vs an estimated ~34%; on the validation games
+  predicted D exceeds truth by 3–9 points, with 5–9% of frames called dead while live, and
+  almost no true dead time missed. Long gaps contain live play (the restart and first touches
+  before the tracker reacquires the ball), and the stoppage / set-piece signals may add more.
+  → 003 candidate: recover live play inside and around gaps (e.g. end the dead stretch at the
+  restart, not at ball reacquisition).
+- Still under-predicting possessions (2440 vs 3399 true): turnovers are being missed, especially
+  inside live stretches where the ball is untracked. → candidate: player-movement evidence.
+- Home share (33%) is well above away (20%) on the full match; worth checking it is football, not
+  a bias in the evidence rule.
+
 ## 001 — MVP rule-based state machine  (2026-11-08)  ✅ KEPT
 
 **Why:** the official baseline flickers (nearest player per frame, then a majority vote), has no
