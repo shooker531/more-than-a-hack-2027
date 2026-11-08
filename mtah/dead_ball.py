@@ -26,18 +26,16 @@ from . import config, domain, runs
 def detect_dead_ball(frame_features: domain.FrameFeatures, tagging: pd.DataFrame,
                      graded_halves: list[domain.GradedHalf],
                      pipeline_config: config.PipelineConfig) -> domain.BoolPerFrame:
-    set_pieces = tagging[tagging["code"] == "set pieces"]
-    set_piece_starts = set_pieces["start_video_frame"].to_numpy(dtype=np.int64)
-    set_piece_restarts = np.array(
-        [_find_restart_video_frame(int(start), frame_features, pipeline_config)
-         for start in set_piece_starts], dtype=np.int64)
-
     is_dead = (frame_features.is_ball_out_of_pitch
                | _detect_collective_stoppages(frame_features, pipeline_config)
-               | _detect_dead_part_of_ball_gaps(frame_features, set_piece_restarts,
-                                                pipeline_config))
+               | runs.drop_true_runs_shorter_than(
+                   ~frame_features.is_ball_tracked,
+                   pipeline_config.ball_gap_dead_min_duration_frames))
 
-    for tag_start_video_frame, restart_video_frame in zip(set_piece_starts, set_piece_restarts):
+    set_pieces = tagging[tagging["code"] == "set pieces"]
+    for tag_start_video_frame in set_pieces["start_video_frame"]:
+        restart_video_frame = _find_restart_video_frame(int(tag_start_video_frame),
+                                                        frame_features, pipeline_config)
         is_dead[tag_start_video_frame:restart_video_frame] = True
         # The restart kick is live even while the players are still slow around it.
         is_dead[restart_video_frame] = False
@@ -63,41 +61,6 @@ def _detect_collective_stoppages(frame_features: domain.FrameFeatures,
                         < pipeline_config.stoppage_player_speed_mps)
     return runs.drop_true_runs_shorter_than(are_players_slow & ~is_ball_visibly_fast,
                                             pipeline_config.stoppage_min_duration_frames)
-
-
-def _detect_dead_part_of_ball_gaps(frame_features: domain.FrameFeatures,
-                                   set_piece_restarts: NDArray[np.int64],
-                                   pipeline_config: config.PipelineConfig) -> domain.BoolPerFrame:
-    """A long gap is dead from where the ball was lost until play restarts, not until the tracker
-    finds the ball again: after a restart the first passes are often still untracked, and calling
-    them dead starts the next possession late and can swallow short possessions whole."""
-    is_dead = np.zeros(len(frame_features.is_ball_tracked), dtype=bool)
-    long_gaps = [(gap_start, gap_end)
-                 for gap_start, gap_end in runs.true_runs(~frame_features.is_ball_tracked)
-                 if gap_end - gap_start >= pipeline_config.ball_gap_dead_min_duration_frames]
-    for gap_start, gap_end in long_gaps:
-        restart_video_frame = _estimate_restart_inside_gap(
-            gap_start, gap_end, frame_features.median_player_speed_mps, set_piece_restarts,
-            pipeline_config)
-        is_dead[gap_start:restart_video_frame] = True
-    return is_dead
-
-
-def _estimate_restart_inside_gap(gap_start: int, gap_end: int,
-                                 median_player_speed_mps: domain.FloatPerFrame,
-                                 set_piece_restarts: NDArray[np.int64],
-                                 pipeline_config: config.PipelineConfig) -> int:
-    """The latest restart evidence inside the gap wins, because the untracked tail after the
-    final restart is the live play to recover. Evidence: a set-piece restart, or the end of the
-    last spell of players walking (play resuming makes everyone speed up). With neither, the
-    whole gap stays dead, as before."""
-    tag_restarts = set_piece_restarts[(set_piece_restarts > gap_start)
-                                      & (set_piece_restarts < gap_end)]
-    walking_offsets = np.flatnonzero(median_player_speed_mps[gap_start:gap_end]
-                                     < pipeline_config.gap_restart_walking_speed_mps)
-    restart_candidates = ([int(restart) for restart in tag_restarts]
-                          + [gap_start + int(offset) + 1 for offset in walking_offsets[-1:]])
-    return max(restart_candidates, default=gap_end)
 
 
 def _find_restart_video_frame(tag_start_video_frame: int, frame_features: domain.FrameFeatures,
