@@ -41,6 +41,11 @@ class PipelineConfig:
     # almost all live (brief occlusions). The challenge ATD shows the same stoppage signature
     # (players slow on 47% of untracked frames vs 10% tracked). A gap this long counts as dead.
     ball_gap_dead_min_duration_frames: int = _seconds_to_frames(2.0)
+    # ...but only until play restarts inside the gap. Players walk while waiting for a restart and
+    # speed up when it is taken, so the end of the last walking spell (1 s-averaged median speed
+    # below this) marks the restart. Slightly above stoppage_player_speed_mps because players are
+    # already moving off as the ball is played.
+    gap_restart_walking_speed_mps: float = 1.5
     # Clean-up: drop dead runs shorter than this; absorb live runs shorter than this between two
     # dead runs (a restart immediately followed by another stoppage is rare).
     dead_min_duration_frames: int = _seconds_to_frames(1.0)
