@@ -37,6 +37,30 @@ Entry template:
 
 ---
 
+## 003 — End gap dead stretches at the estimated restart  (2026-11-08)  ❌ REVERTED
+
+**Why:** 002 over-predicts D (5–9% of validation frames called dead while live). Hypothesis: the
+untracked live play after a restart, before the tracker reacquires the ball, was being labelled
+dead.
+
+**Change:** each long gap stayed dead only until an estimated restart — a set-piece restart
+inside the gap, or the end of the last walking spell (median player speed < 1.5 m/s); with
+neither, the whole gap stayed dead as in 002.
+
+**Validation:** spellF1 0.533 [0.519, 0.547] vs 0.540 for 002. Speed-threshold sweep: tags only
+0.540, < 1.0 m/s 0.539, < 1.5 0.533, < 2.0 0.539, < 2.5 0.541 — no variant beats noise.
+
+**Commit:** 8608f67 (reverted in 61419e1).
+
+**Notes — why it failed (measured on the sample games, 002 behaviour):** of the false-dead frames,
+**83% are whole gaps with no dead time at all** (the ball lost for ≥ 2 s during live play), 13%
+come from rules on tracked frames (walking-pace stoppage, set-piece windows, out of pitch), 3% are
+live play before a stoppage inside a gap, and only **0.7% are the post-restart tail** this
+iteration targeted. The hypothesis was wrong; the diagnosis should have come first.
+→ Next: tell **live-play gaps from dead gaps**. Candidate cue: where the ball was last seen — a
+ball that goes out of play is last seen near a touchline or goal line; a ball lost in live play
+is usually last seen in open play.
+
 ## 002 — Sustained ball gaps count as dead ball  (2026-11-08)  ✅ KEPT
 
 **Why:** 001's notes — the tracker mostly loses the ball when play stops, and the MVP ignored
