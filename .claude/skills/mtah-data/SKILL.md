@@ -26,6 +26,11 @@ extracts thereof** to any third-party hosted or cloud-based LLM. That includes t
   names). Do not `cat`/`head` raw tracking rows, dump DataFrames of positions, print tag
   instances, or read frames of video into the conversation.
 - Code, docs, scores from `run_evaluation.py`, and the public repo files are fine to read.
+- Enforced in `.claude/settings.json`: the Read tool and common shell readers (cat, head, grep,
+  awk, ...) are denied on `data/tactical/`, `data/broadcast/` and the parsed `data/cache/BAR-ATH*`.
+  Pipeline scripts still read the data as normal Python programs, so the "aggregates only" rule
+  for what they print still matters. Public sample data (`data/external/`,
+  `data/cache/validation/`) is not restricted.
 - If a debugging step genuinely needs raw values, have the user look at them locally.
 
 ## 3. Files and where they live
