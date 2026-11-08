@@ -7,7 +7,8 @@ document's "approach" and "assets tried and dropped" sections.
 
 1. Make one change (one idea per iteration).
 2. `.venv/bin/python run.py` — writes the submission and must pass the validator.
-3. Score on the validation games (harness: in progress).
+3. `.venv/bin/python run_validation.py` — scores the pipeline and the official baseline on three
+   public Metrica games (3 degradation seeds each, pooled spellF1 with a bootstrap interval).
 4. `.venv/bin/python scripts/log_experiment.py --iteration NNN --title "..."` — appends the
    numbers to `experiments.csv`. Never type numbers in by hand.
 5. Write the entry below, then commit as `iter-NNN: <title>`.
@@ -36,36 +37,45 @@ Entry template:
 
 ---
 
-## 001 — MVP rule-based state machine  (2026-11-08)  ⏳ PENDING VALIDATION
+## 001 — MVP rule-based state machine  (2026-11-08)  ✅ KEPT
 
 **Why:** the official baseline flickers (nearest player per frame, then a majority vote), has no
 real dead-ball detection, and smears transitions by the vote window.
 
-**Change:** first full pipeline (`run.py` → `mtah/`):
+**Change:** first full pipeline (`run.py` → `mtah/pipeline.py`):
 - dead ball = ball beyond the lines, players walking (< 1 m/s) for ≥ 2 s, set-piece tags until
   the restart kick, and before kick-off;
 - control evidence = slow ball (< 7 m/s) with the nearer team's player within 2 m;
 - possession switches only after the other team controls the ball for ≥ 0.5 s, backdated to when
   that control began; frames without evidence hold the last team.
 
-**Validation:** pending the harness.
+**Validation (3 games × 3 seeds, pooled):** spellF1 **0.421** [0.407, 0.435] vs official baseline
+0.339 [0.329, 0.349] — intervals don't overlap, and it wins on all 9 runs. But macroF1 0.543 vs
+0.780 and alive/dead F1 0.816 vs 0.917: the baseline's dead-ball handling is better. It
+under-predicts possessions (2324 vs 3399 true).
 
 **Full-match sanity:** 345 possessions, mean 13.7 s (median 9.1 s), 48 under 2 s; D 25.8%,
-H 44.5%, A 29.7%. The mean is close to the public window's 14.2 s.
+H 44.5%, A 29.7%.
 
-**Public 5-min check:** valid file, frames aligned; spellF1 0.42 / macroF1 0.67 (baseline_smooth50:
-0.33 / 0.62). Correctness check only, not a ranking.
+**Public 5-min check:** valid file, frames aligned. Correctness only.
 
-**Commit:** see `experiments.csv`.
+**Commit:** 8e1a130 (pipeline code unchanged since 90f2209; output hash identical).
 
-**Notes:** the ball is missing in long blocks (150 gaps, median 11 s, 18% of the match in gaps
-≥ 30 s), and the MVP assumes no turnovers inside them. Inferring possession from player
-movement during gaps is the most promising next step. An untracked ball also correlates with
-stoppages (players slow on 47% of untracked frames vs 10% tracked): a candidate soft signal for
-dead ball.
+**Notes — the key finding for the next iteration:**
+- In the sample games the ball is missing on 92–100% of dead frames and only 6–13% of live ones.
+- The challenge's ATD matches the sample games on the stoppage signature: players are slow on
+  47% of untracked-ball frames vs 10% tracked (samples: 52–56% vs 4–11%). Carried across, ~85%
+  of the challenge's missing-ball frames are probably dead ball, and the match is probably ~34% D
+  — the MVP labels only 25.8%.
+- So **a sustained ball gap is likely our strongest dead-ball signal**, and the MVP deliberately
+  ignores it. That is iteration 002.
+- Caveat: the harness's ball is left undegraded, so if the challenge loses the ball in live play
+  more than estimated, the harness will over-reward a gap → dead rule. Check the full-match D
+  share stays plausible (~30–40%).
 
 ## 000 — Official baseline  (reference)
 
 Nearest tracked player to the ball, centred majority vote ±50 frames (`baseline_smooth50`).
-Full-match spellF1 **0.2433** / macroF1 0.6724 (EVALUATION.md). The floor to beat. It will also
-be scored on the validation games once the harness exists, so 001+ can be compared fairly.
+Full-match spellF1 **0.2433** / macroF1 0.6724 (EVALUATION.md). The floor to beat. Scored
+alongside every iteration in `run_validation.py` (column `validation_baseline_spell_f1`):
+0.339 on the validation games.
