@@ -30,9 +30,13 @@ class DegradeConfig:
     player_missing_share: float = 0.08
     player_dropout_median_frames: float = 50.0
     player_dropout_log_sigma: float = 1.0
-    # Automatic tracking jitters; clean sample positions do not. 0.1 m per axis is a mild,
-    # deliberately conservative perturbation.
+    # Automatic tracking is off by a little; clean sample positions are not. 0.1 m per axis is a
+    # mild, deliberately conservative error. It drifts smoothly (white noise averaged over ~1 s)
+    # rather than jumping every frame: per-frame jitter inflated median player speed by ~0.5 m/s
+    # and erased the walking-at-stoppages signal (0% of dead frames under 1 m/s vs 57% clean),
+    # whereas the challenge ATD keeps it (players slow on 47% of untracked-ball frames).
     position_noise_sd_m: float = 0.1
+    position_noise_smoothing_frames: int = 25
     # Speeds are derived from positions over this centred window, as a tracker would smooth them.
     speed_window_frames: int = 5
 
@@ -46,13 +50,27 @@ def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: Degrad
     players_norm = clean_tracking.players_norm.astype(np.float64).copy()
     noise_sd_norm = np.array([degrade_config.position_noise_sd_m / clean_tracking.pitch_length_m,
                               degrade_config.position_noise_sd_m / clean_tracking.pitch_width_m])
-    players_norm[:, :, :2] += (
-        random_generator.normal(0.0, 1.0, players_norm[:, :, :2].shape) * noise_sd_norm)
+    players_norm[:, :, :2] += _smooth_unit_noise(
+        players_norm[:, :, :2].shape, degrade_config.position_noise_smoothing_frames,
+        random_generator) * noise_sd_norm
     players_norm[_player_dropout_mask(players_norm.shape[0], players_norm.shape[1],
                                       degrade_config, random_generator)] = np.nan
     players_norm[:, :, 2] = _speed_from_positions_mps(players_norm, clean_tracking,
                                                       degrade_config.speed_window_frames)
     return dataclasses.replace(clean_tracking, players_norm=players_norm.astype(np.float32))
+
+
+def _smooth_unit_noise(shape: tuple[int, ...], smoothing_frames: int,
+                       random_generator: np.random.Generator) -> NDArray[np.float64]:
+    """White noise averaged along time (axis 0), then rescaled back to unit variance — averaging
+    k samples shrinks the standard deviation by sqrt(k)."""
+    white_noise = random_generator.normal(0.0, 1.0, shape)
+    cumulative = np.concatenate((np.zeros((1, *shape[1:])), np.cumsum(white_noise, axis=0)))
+    moving_average = (cumulative[smoothing_frames:] - cumulative[:-smoothing_frames]) \
+        / smoothing_frames
+    padded = np.concatenate((moving_average,
+                             np.repeat(moving_average[-1:], smoothing_frames - 1, axis=0)))
+    return padded * np.sqrt(smoothing_frames)
 
 
 def _player_dropout_mask(n_frames: int, n_slots: int, degrade_config: DegradeConfig,
