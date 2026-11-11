@@ -42,6 +42,50 @@ Entry template:
 
 ---
 
+## 004 — Long gaps that look like live play stay live  (2026-11-11)  ❌ REJECTED
+
+**Why:** 003's diagnosis — 83% of false-dead frames are whole ball gaps during live play.
+
+**Diagnosis first (sample games):** where the ball was last seen separates the two kinds of gap
+at the median (live gaps 12 m from the nearest line; dead gaps −0.7 m, i.e. already out), but a
+quarter of dead-gap frames are last seen in open play (fouls, offsides, goals). Adding "players
+never walk ≥ 2 s during the gap" removes most of those, but then recovers only ~14% of live-gap
+frames: net +675 frames, ~0.1% of the match. Predicted: small or no gain.
+
+**Change:** new feature `ball_distance_to_nearest_line_m`; a long gap stays live when the ball
+was last seen > 3 m from every line and players never walk (< 1 m/s) for ≥ 2 s inside it.
+
+**Validation (fixed harness, vs 002r 0.528):** default 0.526; d=5 m 0.526; walk < 4 s 0.523;
+location only 0.513 (worse). None beats noise.
+
+**Full-match sanity:** D 47.2% → 41.2% (location only: 33.4%).
+
+**Code:** not committed — `experiments/patches/004.patch` on f9f1750.
+
+**Notes:**
+- As the diagnosis predicted. The location cue on its own is net harmful because fouls,
+  offsides and goals stop play in open field.
+- Many "live" gaps in the event-derived truth contain long walking spells (p75 11.6 s): likely
+  stoppages the event rules miss (injuries, substitutions, outs with no logged event). Part of
+  the remaining "false dead" may be truth-label error, which caps what dead-ball work can show
+  on this harness.
+- On the real match this rule moves D a lot (47% → 41%) while validation barely moves: the
+  harness cannot say which is right there. Dead-ball tuning has hit diminishing returns on this
+  validation set → shift focus to **possession switching** (2,521 predicted vs 3,399 true:
+  turnovers are missed).
+
+## Harness fix — smooth position noise  (2026-11-11)
+
+Found during 004's diagnosis: degraded tracking added independent 0.1 m noise every frame, which
+inflated derived player speeds by ~0.5 m/s and erased the walking-at-stoppages signal (0% of dead
+frames under 1 m/s, vs 57% on clean data and ~47% on the challenge ATD). The walking-pace stoppage
+rule therefore never fired in validation. Noise now drifts smoothly over ~1 s (same 0.12 m
+error; walking signal restored: 51% dead / 6.7% live).
+
+**All scores before this point are on the old harness.** 002 re-scored on the fixed harness
+(`002r` in `experiments.csv`): **0.528** [0.514, 0.542] — the new reference to beat. The small
+drop from 0.540 suggests the now-active walking rule over-fires a little during slow live play.
+
 ## 003 — End gap dead stretches at the estimated restart  (2026-11-08)  ❌ REVERTED
 
 **Why:** 002 over-predicts D (5–9% of validation frames called dead while live). Hypothesis: the
