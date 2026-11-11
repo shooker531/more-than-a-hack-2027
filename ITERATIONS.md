@@ -5,13 +5,18 @@ document's "approach" and "assets tried and dropped" sections.
 
 ## How an iteration works
 
-1. Make one change (one idea per iteration).
-2. `.venv/bin/python run.py` — writes the submission and must pass the validator.
-3. `.venv/bin/python run_validation.py` — scores the pipeline and the official baseline on three
+1. **Diagnose first**: measure on the sample games that the problem you are fixing is where the
+   errors actually are (lesson from 003).
+2. Make one change (one idea per iteration).
+3. `.venv/bin/python run.py` — writes the submission and must pass the validator.
+4. `.venv/bin/python run_validation.py` — scores the pipeline and the official baseline on three
    public Metrica games (3 degradation seeds each, pooled spellF1 with a bootstrap interval).
-4. `.venv/bin/python scripts/log_experiment.py --iteration NNN --title "..."` — appends the
-   numbers to `experiments.csv`. Never type numbers in by hand.
-5. Write the entry below, then commit as `iter-NNN: <title>`.
+5. Decide with the rule below, then:
+   - **Kept:** commit the code as `iter-NNN: <title>`, then
+     `.venv/bin/python scripts/log_experiment.py --iteration NNN --title "..."`.
+   - **Rejected:** log *without* committing — the script saves the change as
+     `experiments/patches/NNN.patch` — then discard it (`git checkout -- <files>`, delete new files).
+6. Write the entry below and commit `ITERATIONS.md`, `experiments.csv` (and any patch).
 
 ## Decision rule
 

@@ -9,6 +9,11 @@ experiments.csv is safe to commit and to share.
 
 Validation columns come from evaluation/reports/validation_latest.json, written by
 run_validation.py — run it first. They are the numbers that decide whether an iteration is kept.
+
+Code version: kept iterations are committed first, so the row records a clean commit. A rejected
+iteration is never committed: its uncommitted change is saved as experiments/patches/<id>.patch
+(applies on top of the recorded base commit) and the row points at it, so the code is preserved
+for the write-up without a commit-and-revert round trip.
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ from mtah import config, load, write  # noqa: E402
 _EXPERIMENTS_CSV = os.path.join(_REPO_ROOT, "experiments.csv")
 _DEFAULT_SUBMISSION = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
 _VALIDATION_RESULTS = os.path.join(_REPO_ROOT, "evaluation", "reports", "validation_latest.json")
+_PATCH_DIR = os.path.join(_REPO_ROOT, "experiments", "patches")
+# Log files are always edited after the run they describe, so they are never part of the code.
+_LOG_PATHSPEC = [".", ":!experiments.csv", ":!ITERATIONS.md", ":!experiments/"]
 
 
 def main(iteration: str, title: str, submission_path: str) -> None:
@@ -41,7 +49,7 @@ def main(iteration: str, title: str, submission_path: str) -> None:
         "iteration": iteration,
         "title": title,
         "logged_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M"),
-        "git_commit": _current_git_commit(),
+        "git_commit": _record_code_version(iteration),
         **_validation_columns(_VALIDATION_RESULTS),
         **{"full_match_" + name: round(value, 4) for name, value in full_match_summary.items()},
         "config_json": json.dumps(dataclasses.asdict(config.DEFAULT_CONFIG), sort_keys=True),
@@ -66,16 +74,28 @@ def _validation_columns(results_path: str) -> dict[str, object]:
     }
 
 
-def _current_git_commit() -> str:
-    """Suffixed with '+dirty' when there are uncommitted changes, so a row can never silently
-    point at code that differs from what produced it. The log files themselves are excluded:
-    they are always edited after the run they describe."""
-    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=_REPO_ROOT,
-                            capture_output=True, text=True, check=True).stdout.strip()
-    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "--", ".",
-                             ":!experiments.csv", ":!ITERATIONS.md"],
-                            cwd=_REPO_ROOT, capture_output=True, text=True, check=True).stdout
-    return commit + ("+dirty" if status.strip() else "")
+def _record_code_version(iteration: str) -> str:
+    """'<commit>' when the code is committed, else '<base commit>+patch:<path>' after saving the
+    uncommitted change (including new, untracked files) as a patch."""
+    base_commit = _git(["rev-parse", "--short", "HEAD"]).strip()
+    untracked_files = _git(["ls-files", "--others", "--exclude-standard", "--", *_LOG_PATHSPEC])
+    tracked_diff = _git(["diff", "HEAD", "--", *_LOG_PATHSPEC])
+    untracked_diff = "".join(_git(["diff", "--no-index", "--", os.devnull, path], check=False)
+                             for path in untracked_files.split())
+    patch_text = tracked_diff + untracked_diff
+    patch_path = os.path.join(_PATCH_DIR, "{}.patch".format(iteration))
+    if patch_text:
+        os.makedirs(_PATCH_DIR, exist_ok=True)
+        with open(patch_path, "w") as handle:
+            handle.write(patch_text)
+    return (base_commit + "+patch:" + os.path.relpath(patch_path, _REPO_ROOT) if patch_text
+            else base_commit)
+
+
+def _git(arguments: list[str], check: bool = True) -> str:
+    """git diff --no-index exits 1 when files differ, which is its normal answer, hence check."""
+    return subprocess.run(["git", *arguments], cwd=_REPO_ROOT, capture_output=True, text=True,
+                          check=check).stdout
 
 
 def _append_row(csv_path: str, row: dict[str, object]) -> None:
