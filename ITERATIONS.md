@@ -1,185 +1,103 @@
 # Iteration log
 
-One entry per experiment, newest first — including the ones we revert. This feeds the technical
-document's "approach" and "assets tried and dropped" sections.
+One entry per experiment, newest first, including rejected ones. Full numbers and configs are in
+`experiments.csv`.
 
-## How an iteration works
+## Scoreboard
 
-1. **Diagnose first**: measure on the sample games that the problem you are fixing is where the
-   errors actually are (lesson from 003).
-2. Make one change (one idea per iteration).
-3. `.venv/bin/python run.py` — writes the submission and must pass the validator.
-4. `.venv/bin/python run_validation.py` — scores the pipeline and the official baseline on three
-   public Metrica games (3 degradation seeds each, pooled spellF1 with a bootstrap interval).
-5. Decide with the rule below, then:
-   - **Kept:** commit the code as `iter-NNN: <title>`, then
-     `.venv/bin/python scripts/log_experiment.py --iteration NNN --title "..."`.
-   - **Rejected:** log *without* committing — the script saves the change as
-     `experiments/patches/NNN.patch` — then discard it (`git checkout -- <files>`, delete new files).
-6. Write the entry below and commit `ITERATIONS.md`, `experiments.csv` (and any patch).
+Validation spellF1 on the sample games (higher is better). Scores before the harness fix are not
+comparable with those after it.
 
-## Decision rule
+| # | Change | Validation spellF1 | Result |
+|---|---|---|---|
+| 005 | Touch evidence; switch on two opponent touches | **0.596** | ✅ kept |
+| 004 | Long gaps seen in open play stay live | 0.526 | ❌ rejected |
+| — | *Harness fix (002 re-scored: 0.528)* | — | — |
+| 003 | End dead gaps at the restart | 0.533 | ❌ rejected |
+| 002 | Ball missing ≥ 2 s = dead ball | 0.540 | ✅ kept |
+| 001 | MVP rule-based state machine | 0.421 | ✅ kept |
+| 000 | Official baseline | 0.339 | reference |
 
-- **Keep** a change only if it improves **spellF1 on the validation games** by more than the
-  noise (non-overlapping bootstrap intervals, or a consistent gain across games).
-- Full-match counts (possessions, durations, D share) are **sanity checks only**: they must stay
-  football-plausible, but they cannot tell us which version is better.
-- The public 5-minute window is for **correctness checks only** (alignment, file format). Never
-  for choosing between versions — that is against the rules, and it picks the wrong version
-  anyway (EVALUATION.md).
+## How we iterate
 
-Entry template:
+1. **Diagnose first** on the sample games: check the errors are where you think they are.
+2. Make one change.
+3. Run `run.py`, then `run_validation.py`.
+4. Log it: `scripts/log_experiment.py --iteration NNN --title "..."`. Uncommitted work is saved
+   as `experiments/patches/NNN.patch`.
+5. Keep it only if validation spellF1 beats the noise (intervals don't overlap). Otherwise
+   discard the change; the patch keeps it for the write-up.
 
-```markdown
-## NNN — <title>  (YYYY-MM-DD)  ✅ KEPT | ❌ REVERTED | ⏳ PENDING
-**Why:** the problem or hypothesis.
-**Change:** what was done, which modules.
-**Validation:** spellF1 before → after (games, interval).
-**Full-match sanity:** possessions, mean duration, D share.
-**Commit:** <hash>
-**Notes:** what we learned, follow-ups.
-```
+Full-match counts are sanity checks only. The public 5 minutes are for correctness checks only,
+never for choosing versions.
 
 ---
 
-## 004 — Long gaps that look like live play stay live  (2026-11-11)  ❌ REJECTED
+## 005 — Touch evidence; switch on two opponent touches  ✅ KEPT
 
-**Why:** 003's diagnosis — 83% of false-dead frames are whole ball gaps during live play.
+**Problem:** we matched only 47% of true possessions. The misses were short possessions with the
+ball tracked. At turnovers the new team's player was right by the ball (median 0.4 m), but the
+ball was fast (median 12 m/s), so our "slow ball = control" rule ignored it.
 
-**Diagnosis first (sample games):** where the ball was last seen separates the two kinds of gap
-at the median (live gaps 12 m from the nearest line; dead gaps −0.7 m, i.e. already out), but a
-quarter of dead-gap frames are last seen in open play (fouls, offsides, goals). Adding "players
-never walk ≥ 2 s during the gap" removes most of those, but then recovers only ~14% of live-gap
-frames: net +675 frames, ~0.1% of the match. Predicted: small or no gain.
+**Change:** a player within 1 m of the ball counts as a touch, at any speed. Possession switches
+after two touches in a row by the other team (e.g. interception then pass), as well as after
+0.5 s of control.
 
-**Change:** new feature `ball_distance_to_nearest_line_m`; a long gap stays live when the ball
-was last seen > 3 m from every line and players never walk (< 1 m/s) for ≥ 2 s inside it.
+**Result:** 0.528 → **0.596**. Possessions predicted 2521 → 2836 (true 3399). 3 touches: 0.564;
+1.5 m radius: 0.577.
 
-**Validation (fixed harness, vs 002r 0.528):** default 0.526; d=5 m 0.526; walk < 4 s 0.523;
-location only 0.513 (worse). None beats noise.
+**Next:** still missing ~560 possessions. Re-run the diagnosis on 005.
 
-**Full-match sanity:** D 47.2% → 41.2% (location only: 33.4%).
+## 004 — Long gaps seen in open play stay live  ❌ REJECTED
 
-**Code:** not committed — `experiments/patches/004.patch` on f9f1750.
+**Problem:** 83% of wrongly dead frames are ball gaps during live play.
 
-**Notes:**
-- As the diagnosis predicted. The location cue on its own is net harmful because fouls,
-  offsides and goals stop play in open field.
-- Many "live" gaps in the event-derived truth contain long walking spells (p75 11.6 s): likely
-  stoppages the event rules miss (injuries, substitutions, outs with no logged event). Part of
-  the remaining "false dead" may be truth-label error, which caps what dead-ball work can show
-  on this harness.
-- On the real match this rule moves D a lot (47% → 41%) while validation barely moves: the
-  harness cannot say which is right there. Dead-ball tuning has hit diminishing returns on this
-  validation set → shift focus to **possession switching** (2,521 predicted vs 3,399 true:
-  turnovers are missed).
+**Change:** a gap stays live if the ball was last seen > 3 m from every line and players never
+walk for 2 s.
 
-## Harness fix — smooth position noise  (2026-11-11)
+**Result:** 0.526 vs 0.528. Fouls, offsides and goals also stop play in open field, so location
+alone hurts (0.513).
 
-Found during 004's diagnosis: degraded tracking added independent 0.1 m noise every frame, which
-inflated derived player speeds by ~0.5 m/s and erased the walking-at-stoppages signal (0% of dead
-frames under 1 m/s, vs 57% on clean data and ~47% on the challenge ATD). The walking-pace stoppage
-rule therefore never fired in validation. Noise now drifts smoothly over ~1 s (same 0.12 m
-error; walking signal restored: 51% dead / 6.7% live).
+**Learned:** walking players are often just settled play, so walking is a weak stoppage signal.
+Dead-ball work has hit diminishing returns.
 
-**All scores before this point are on the old harness.** 002 re-scored on the fixed harness
-(`002r` in `experiments.csv`): **0.528** [0.514, 0.542] — the new reference to beat. The small
-drop from 0.540 suggests the now-active walking rule over-fires a little during slow live play.
+## Harness fix — smooth position noise
 
-## 003 — End gap dead stretches at the estimated restart  (2026-11-08)  ❌ REVERTED
+The fake tracking noise jumped every frame, so players never looked like they were walking, and
+the walking-stoppage rule never fired in validation. Noise now drifts smoothly. 002 re-scored at
+**0.528**, the new reference.
 
-**Why:** 002 over-predicts D (5–9% of validation frames called dead while live). Hypothesis: the
-untracked live play after a restart, before the tracker reacquires the ball, was being labelled
-dead.
+## 003 — End dead gaps at the restart  ❌ REJECTED
 
-**Change:** each long gap stayed dead only until an estimated restart — a set-piece restart
-inside the gap, or the end of the last walking spell (median player speed < 1.5 m/s); with
-neither, the whole gap stayed dead as in 002.
+**Problem:** 002 calls 5–9% of live frames dead.
 
-**Validation:** spellF1 0.533 [0.519, 0.547] vs 0.540 for 002. Speed-threshold sweep: tags only
-0.540, < 1.0 m/s 0.539, < 1.5 0.533, < 2.0 0.539, < 2.5 0.541 — no variant beats noise.
+**Change:** a long gap stays dead only until play restarts (set-piece tag, or players speed up).
 
-**Commit:** 8608f67 (reverted in 61419e1).
+**Result:** 0.533 vs 0.540. Only 0.7% of the wrongly dead frames were after a restart; 83% were
+whole gaps in live play. Should have diagnosed first.
 
-**Notes — why it failed (measured on the sample games, 002 behaviour):** of the false-dead frames,
-**83% are whole gaps with no dead time at all** (the ball lost for ≥ 2 s during live play), 13%
-come from rules on tracked frames (walking-pace stoppage, set-piece windows, out of pitch), 3% are
-live play before a stoppage inside a gap, and only **0.7% are the post-restart tail** this
-iteration targeted. The hypothesis was wrong; the diagnosis should have come first.
-→ Next: tell **live-play gaps from dead gaps**. Candidate cue: where the ball was last seen — a
-ball that goes out of play is last seen near a touchline or goal line; a ball lost in live play
-is usually last seen in open play.
+## 002 — Ball missing ≥ 2 s = dead ball  ✅ KEPT
 
-## 002 — Sustained ball gaps count as dead ball  (2026-11-08)  ✅ KEPT
+**Problem:** the tracker mostly loses the ball when play stops, and the MVP ignored that.
 
-**Why:** 001's notes — the tracker mostly loses the ball when play stops, and the MVP ignored
-that signal entirely.
+**Change:** any ball gap of 2 s or more is dead ball.
 
-**Change:** `dead_ball.py` adds one signal: any untracked-ball gap of ≥ 2 s is dead
-(`ball_gap_dead_min_duration_frames`). On the sample games, gaps ≥ 2 s are 71–85% dead time while
-gaps < 1 s are almost all live.
+**Result:** 0.421 → **0.540**. Dead-ball F1 0.82 → 0.94. Any threshold from 1 to 4 s works.
 
-**Validation (3 games × 3 seeds, pooled):** spellF1 0.421 → **0.540** [0.525, 0.554], macroF1
-0.543 → 0.858, alive/dead F1 0.816 → 0.942 (now above the baseline's 0.917). Baseline 0.339.
-Threshold sweep was flat: 1 s 0.542, 2 s 0.540, 3 s 0.538, 4 s 0.537, 6 s 0.534 — so the gain is
-not riding on a fragile number.
+**Side effect:** full match is now 47% dead ball, probably too high (estimate ~34%).
 
-**Full-match sanity:** 350 possessions, mean 9.6 s (median 6.3 s), 56 under 2 s; D 47.2%,
-H 33.0%, A 19.8%.
+## 001 — MVP rule-based state machine  ✅ KEPT
 
-**Commit:** 84c8498
+**Change:** first pipeline. Dead ball = ball out, players walking ≥ 2 s, set pieces, before
+kick-off. A team gets possession after 0.5 s of control (player within 2 m of a slow ball).
 
-**Notes:**
-- **D is now over-predicted.** Full match 47% vs an estimated ~34%; on the validation games
-  predicted D exceeds truth by 3–9 points, with 5–9% of frames called dead while live, and
-  almost no true dead time missed. Long gaps contain live play (the restart and first touches
-  before the tracker reacquires the ball), and the stoppage / set-piece signals may add more.
-  → 003 candidate: recover live play inside and around gaps (e.g. end the dead stretch at the
-  restart, not at ball reacquisition).
-- Still under-predicting possessions (2440 vs 3399 true): turnovers are being missed, especially
-  inside live stretches where the ball is untracked. → candidate: player-movement evidence.
-- Home share (33%) is well above away (20%) on the full match; worth checking it is football, not
-  a bias in the evidence rule.
+**Result:** **0.421** vs baseline 0.339, winning on all 9 runs. Weaker than the baseline on dead
+ball.
 
-## 001 — MVP rule-based state machine  (2026-11-08)  ✅ KEPT
+**Learned:** in the sample games the ball is missing on 92–100% of dead frames. Our match shows
+the same pattern, which led to 002.
 
-**Why:** the official baseline flickers (nearest player per frame, then a majority vote), has no
-real dead-ball detection, and smears transitions by the vote window.
+## 000 — Official baseline
 
-**Change:** first full pipeline (`run.py` → `mtah/pipeline.py`):
-- dead ball = ball beyond the lines, players walking (< 1 m/s) for ≥ 2 s, set-piece tags until
-  the restart kick, and before kick-off;
-- control evidence = slow ball (< 7 m/s) with the nearer team's player within 2 m;
-- possession switches only after the other team controls the ball for ≥ 0.5 s, backdated to when
-  that control began; frames without evidence hold the last team.
-
-**Validation (3 games × 3 seeds, pooled):** spellF1 **0.421** [0.407, 0.435] vs official baseline
-0.339 [0.329, 0.349] — intervals don't overlap, and it wins on all 9 runs. But macroF1 0.543 vs
-0.780 and alive/dead F1 0.816 vs 0.917: the baseline's dead-ball handling is better. It
-under-predicts possessions (2324 vs 3399 true).
-
-**Full-match sanity:** 345 possessions, mean 13.7 s (median 9.1 s), 48 under 2 s; D 25.8%,
-H 44.5%, A 29.7%.
-
-**Public 5-min check:** valid file, frames aligned. Correctness only.
-
-**Commit:** 8e1a130 (pipeline code unchanged since 90f2209; output hash identical).
-
-**Notes — the key finding for the next iteration:**
-- In the sample games the ball is missing on 92–100% of dead frames and only 6–13% of live ones.
-- The challenge's ATD matches the sample games on the stoppage signature: players are slow on
-  47% of untracked-ball frames vs 10% tracked (samples: 52–56% vs 4–11%). Carried across, ~85%
-  of the challenge's missing-ball frames are probably dead ball, and the match is probably ~34% D
-  — the MVP labels only 25.8%.
-- So **a sustained ball gap is likely our strongest dead-ball signal**, and the MVP deliberately
-  ignores it. That is iteration 002.
-- Caveat: the harness's ball is left undegraded, so if the challenge loses the ball in live play
-  more than estimated, the harness will over-reward a gap → dead rule. Check the full-match D
-  share stays plausible (~30–40%).
-
-## 000 — Official baseline  (reference)
-
-Nearest tracked player to the ball, centred majority vote ±50 frames (`baseline_smooth50`).
-Full-match spellF1 **0.2433** / macroF1 0.6724 (EVALUATION.md). The floor to beat. Scored
-alongside every iteration in `run_validation.py` (column `validation_baseline_spell_f1`):
-0.339 on the validation games.
+Nearest player to the ball, smoothed over ±2 s. Full match 0.2433 (published floor);
+validation 0.339.

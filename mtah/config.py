@@ -58,6 +58,10 @@ class PipelineConfig:
     control_radius_m: float = 2.0
     # A faster ball is a pass or shot in flight, not under anyone's control.
     control_max_ball_speed_mps: float = 7.0
+    # A player this close is playing the ball, whatever its speed: about a leg's reach plus
+    # tracking error. Tighter than control_radius_m because fast balls pass near players
+    # without being touched.
+    touch_radius_m: float = 1.0
 
     # --- possession switching (the "controlled possession" rule) ---------------------------
     # Evidence frames of one team separated by holes up to this long form one control episode.
@@ -65,6 +69,10 @@ class PipelineConfig:
     # An opposing episode must last this long to take possession: a touch or deflection is
     # shorter, receiving and controlling the ball is longer.
     possession_switch_min_episode_frames: int = _seconds_to_frames(0.5)
+    # ...or the other team touches the ball this many times in a row with no touch by the
+    # holding team in between: an interception then a pass, or a completed pass — CHALLENGE.md's
+    # own proxy for control. One touch alone (a deflection, a duel) never switches possession.
+    possession_switch_consecutive_touches: int = 2
 
 
 DEFAULT_CONFIG = PipelineConfig()

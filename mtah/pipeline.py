@@ -19,5 +19,6 @@ def label_possessions(tracking: domain.TrackingData, tagging: pd.DataFrame,
     frame_features = features.compute_frame_features(tracking, pipeline_config)
     is_dead = dead_ball.detect_dead_ball(frame_features, tagging, graded_halves, pipeline_config)
     control_evidence = evidence.detect_control_evidence(frame_features, pipeline_config)
-    return decode_rules.decode_possession_labels(control_evidence, is_dead, tagging,
-                                                 graded_halves, pipeline_config)
+    touch_evidence = evidence.detect_touch_evidence(frame_features, pipeline_config)
+    return decode_rules.decode_possession_labels(control_evidence, touch_evidence, is_dead,
+                                                 tagging, graded_halves, pipeline_config)
