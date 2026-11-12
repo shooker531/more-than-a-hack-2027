@@ -10,6 +10,8 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
+| 008 | Recalibrate contest margin (1.0 m) and touch radius (1.5 m) | **0.578** | ✅ kept |
+| — | *Harness fix: realistic ball error (006: 0.552, 005: 0.509, baseline: 0.330)* | — | — |
 | 007 | Viterbi decoder (hand-set scores) | 0.643 (vs 0.658) | ❌ rejected |
 | — | *Truth fix: controlled possession only (005: 0.638, 006: 0.658)* | — | — |
 | 006 | No evidence when the ball is contested | 0.610 | ✅ kept |
@@ -36,6 +38,29 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 008 — Recalibrate contest margin and touch radius  ✅ KEPT
+
+**Problem:** both settings were tuned on the old harness, where the ball sat unrealistically
+close to players.
+
+**Change:** contest margin 0.5 → 1.0 m (control and touch), touch radius 1.0 → 1.5 m.
+
+**Result:** 0.552 → **0.578**, better on 8 of 9 runs. Predicted possessions now match the truth
+(2818 vs 2802). Margins alone at 1.0 m: 0.571 (9/9 runs); 2.0 m: 0.563.
+
+## Harness fix — realistic ball error
+
+**Problem:** 006 barely beat the baseline on the public 5 minutes (0.332 vs 0.326) despite
+doubling it on validation. Comparing statistics (no labels) showed why: in the sample games the
+ball is glued to players' feet (within 1 m of a player 43–54% of the time vs 28.5% on our match),
+so touch evidence fired twice as often as it really does.
+
+**Change:** degraded tracking now adds ball error: a gently drifting 0.8 m offset plus small
+jitter, sized to match the real match. `scripts/compare_harness_realism.py` checks this.
+
+**Result:** scores drop to realistic levels: 006 0.658 → 0.552, baseline 0.356 → 0.330. The
+ranking holds (006 > 005 0.509 > no touch rule 0.526), so our iterations still help.
 
 ## 007 — Viterbi decoder  ❌ REJECTED
 

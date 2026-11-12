@@ -58,15 +58,17 @@ class PipelineConfig:
     control_radius_m: float = 2.0
     # A faster ball is a pass or shot in flight, not under anyone's control.
     control_max_ball_speed_mps: float = 7.0
-    # A player this close is playing the ball, whatever its speed: about a leg's reach plus
-    # tracking error. Tighter than control_radius_m because fast balls pass near players
-    # without being touched.
-    touch_radius_m: float = 1.0
+    # A player this close is playing the ball, whatever its speed: a leg's reach plus the
+    # automatic tracker's ball error (the real ball sits >= 0.44 m from the nearest player 90% of
+    # the time, so contact rarely looks closer than ~0.5 m). Tighter than control_radius_m
+    # because fast balls pass near players without being touched.
+    touch_radius_m: float = 1.5
     # A team only gets evidence when its nearest player is this much nearer the ball than any
     # opponent. On the sample games 42% of invented possessions handed the ball to the wrong
-    # team: in duels and under tight marking the defender is often the nearest player.
-    control_contest_margin_m: float = 0.5
-    touch_contest_margin_m: float = 0.5
+    # team: in duels and under tight marking the defender is often the nearest player. With the
+    # real tracker's ball error, "nearer" needs a full metre to be trustworthy.
+    control_contest_margin_m: float = 1.0
+    touch_contest_margin_m: float = 1.0
 
     # --- possession switching (the "controlled possession" rule) ---------------------------
     # Evidence frames of one team separated by holes up to this long form one control episode.

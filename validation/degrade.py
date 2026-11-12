@@ -37,6 +37,16 @@ class DegradeConfig:
     # whereas the challenge ATD keeps it (players slow on 47% of untracked-ball frames).
     position_noise_sd_m: float = 0.1
     position_noise_smoothing_frames: int = 25
+    # The sample games' ball is often glued to a player's feet (nearest player p10 0.09 m, within
+    # 1 m on ~53% of tracked frames); the challenge's automatic ball is not (p10 0.44 m, 28.5%)
+    # and wobbles 2-3x more frame to frame. Ball error = a smoothly drifting offset plus
+    # per-frame jitter, sized so those statistics match the real match
+    # (scripts/compare_harness_realism.py).
+    ball_noise_drift_sd_m: float = 0.8
+    ball_noise_jitter_sd_m: float = 0.003
+    # The real ball barely wobbles (|acceleration| p50 0.01 m/frame^2), so its error must curve
+    # gently: averaged twice over this window, not once.
+    ball_noise_smoothing_frames: int = 50
     # Speeds are derived from positions over this centred window, as a tracker would smooth them.
     speed_window_frames: int = 5
 
@@ -57,7 +67,17 @@ def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: Degrad
                                       degrade_config, random_generator)] = np.nan
     players_norm[:, :, 2] = _speed_from_positions_mps(players_norm, clean_tracking,
                                                       degrade_config.speed_window_frames)
-    return dataclasses.replace(clean_tracking, players_norm=players_norm.astype(np.float32))
+    ball_norm = clean_tracking.ball_norm.astype(np.float64).copy()
+    pitch_size_m = np.array([clean_tracking.pitch_length_m, clean_tracking.pitch_width_m])
+    ball_error_m = (_twice_smoothed_unit_noise((len(ball_norm), 2),
+                                               degrade_config.ball_noise_smoothing_frames,
+                                               random_generator)
+                    * degrade_config.ball_noise_drift_sd_m
+                    + random_generator.normal(0.0, degrade_config.ball_noise_jitter_sd_m,
+                                              (len(ball_norm), 2)))
+    ball_norm[:, :2] += ball_error_m / pitch_size_m
+    return dataclasses.replace(clean_tracking, players_norm=players_norm.astype(np.float32),
+                               ball_norm=ball_norm.astype(np.float32))
 
 
 def _smooth_unit_noise(shape: tuple[int, ...], smoothing_frames: int,
@@ -71,6 +91,18 @@ def _smooth_unit_noise(shape: tuple[int, ...], smoothing_frames: int,
     padded = np.concatenate((moving_average,
                              np.repeat(moving_average[-1:], smoothing_frames - 1, axis=0)))
     return padded * np.sqrt(smoothing_frames)
+
+
+def _twice_smoothed_unit_noise(shape: tuple[int, int], smoothing_frames: int,
+                               random_generator: np.random.Generator) -> NDArray[np.float64]:
+    """Averaging twice gives a triangular kernel: the error drifts without frame-to-frame kinks.
+    Rescaled to unit standard deviation empirically, since the double average has no simple
+    closed-form shrinkage once padded."""
+    once = _smooth_unit_noise(shape, smoothing_frames, random_generator)
+    cumulative = np.concatenate((np.zeros((1, shape[1])), np.cumsum(once, axis=0)))
+    twice = (cumulative[smoothing_frames:] - cumulative[:-smoothing_frames]) / smoothing_frames
+    twice = np.concatenate((twice, np.repeat(twice[-1:], smoothing_frames - 1, axis=0)))
+    return twice / twice.std(axis=0)
 
 
 def _player_dropout_mask(n_frames: int, n_slots: int, degrade_config: DegradeConfig,
