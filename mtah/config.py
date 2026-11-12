@@ -62,6 +62,11 @@ class PipelineConfig:
     # tracking error. Tighter than control_radius_m because fast balls pass near players
     # without being touched.
     touch_radius_m: float = 1.0
+    # A team only gets evidence when its nearest player is this much nearer the ball than any
+    # opponent. On the sample games 42% of invented possessions handed the ball to the wrong
+    # team: in duels and under tight marking the defender is often the nearest player.
+    control_contest_margin_m: float = 0.5
+    touch_contest_margin_m: float = 0.5
 
     # --- possession switching (the "controlled possession" rule) ---------------------------
     # Evidence frames of one team separated by holes up to this long form one control episode.
@@ -73,6 +78,7 @@ class PipelineConfig:
     # holding team in between: an interception then a pass, or a completed pass — CHALLENGE.md's
     # own proxy for control. One touch alone (a deflection, a duel) never switches possession.
     possession_switch_consecutive_touches: int = 2
+
 
 
 DEFAULT_CONFIG = PipelineConfig()

@@ -5,12 +5,15 @@ One entry per experiment, newest first, including rejected ones. Full numbers an
 
 ## Scoreboard
 
-Validation spellF1 on the sample games (higher is better). Scores before the harness fix are not
-comparable with those after it.
+Validation spellF1 on the sample games (higher is better). Scores are only comparable within
+the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
-| 005 | Touch evidence; switch on two opponent touches | **0.596** | ✅ kept |
+| 007 | Viterbi decoder (hand-set scores) | 0.643 (vs 0.658) | ❌ rejected |
+| — | *Truth fix: controlled possession only (005: 0.638, 006: 0.658)* | — | — |
+| 006 | No evidence when the ball is contested | 0.610 | ✅ kept |
+| 005 | Touch evidence; switch on two opponent touches | 0.596 | ✅ kept |
 | 004 | Long gaps seen in open play stay live | 0.526 | ❌ rejected |
 | — | *Harness fix (002 re-scored: 0.528)* | — | — |
 | 003 | End dead gaps at the restart | 0.533 | ❌ rejected |
@@ -25,13 +28,60 @@ comparable with those after it.
 3. Run `run.py`, then `run_validation.py`.
 4. Log it: `scripts/log_experiment.py --iteration NNN --title "..."`. Uncommitted work is saved
    as `experiments/patches/NNN.patch`.
-5. Keep it only if validation spellF1 beats the noise (intervals don't overlap). Otherwise
+5. Keep it only if validation spellF1 beats the noise: intervals don't overlap, or it wins on
+   (nearly) every game/seed run against the previous version. Otherwise
    discard the change; the patch keeps it for the write-up.
 
 Full-match counts are sanity checks only. The public 5 minutes are for correctness checks only,
 never for choosing versions.
 
 ---
+
+## 007 — Viterbi decoder  ❌ REJECTED
+
+**Problem:** the rules combine evidence badly: possessions are missed even with 2+ touches, and
+one long ball gap always forces dead ball.
+
+**Change:** each frame scores H, A and D from the evidence; every change of state has a cost;
+Viterbi picks the best sequence per half. Replaces all hard thresholds with one trade-off.
+
+**Result:** best 0.643 vs 0.658 for the rules (initial guesses 0.631). Scoring touches once per
+touch instead of per frame helped (0.631 → 0.643); lowering the switch cost added false
+possessions; lowering the control weight made things worse.
+
+**Learned:** the rules encode order ("two touches in a row with no opponent touch between"),
+which adding up per-frame scores cannot express. With hand-set scores Viterbi is a cruder
+version of the rules. Worth revisiting once a learned model supplies calibrated per-frame
+probabilities. A semi-Markov version would hit the same limit, so not tried.
+
+**Code:** `experiments/patches/007.patch` (applies on top of 006).
+
+## Truth fix — controlled possession only
+
+**Problem:** the sample truth counted every "won it, lost it straight away" as a possession
+(26% of possessions under 2 s), which CHALLENGE.md says is not a change of possession.
+
+**Change:** a new team's spell only counts if it shows control: a completed pass, a carry, a
+shot, a set piece, or keeping the ball for 2 s of live play. Otherwise it merges into the
+previous team's possession.
+
+**Result:** the truth now looks like the public answer key (under 2 s: 13% vs 12%; median 7.3 s
+vs 7.6 s). Re-scored: 005 0.638, **006 0.658** (wins 9/9 runs vs 005), baseline 0.356.
+Predicted possessions are now close to true (2644 vs 2802), so most of the "missing
+possessions" were truth artefacts.
+
+## 006 — No evidence when the ball is contested  ✅ KEPT
+
+**Problem:** 32% of our predicted possessions matched nothing. The biggest cause (42%) was giving
+the ball to the wrong team in duels and tight marking, where the defender is often nearest.
+
+**Change:** a team only gets evidence when its player is at least 0.5 m nearer the ball than
+any opponent. Otherwise the ball counts as contested and stays with the last team.
+
+**Result:** 0.596 → **0.610**. Small but consistent: better on 8 of 9 runs. A 1.0 m margin was a
+coin flip (6/9); 1.5 m was worse (0.587).
+
+**Next:** done — see the truth fix above.
 
 ## 005 — Touch evidence; switch on two opponent touches  ✅ KEPT
 
@@ -46,7 +96,7 @@ after two touches in a row by the other team (e.g. interception then pass), as w
 **Result:** 0.528 → **0.596**. Possessions predicted 2521 → 2836 (true 3399). 3 touches: 0.564;
 1.5 m radius: 0.577.
 
-**Next:** still missing ~560 possessions. Re-run the diagnosis on 005.
+**Next:** still missing ~560 possessions (mostly a truth artefact, see the truth fix).
 
 ## 004 — Long gaps seen in open play stay live  ❌ REJECTED
 

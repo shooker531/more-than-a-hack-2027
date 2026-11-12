@@ -1,0 +1,269 @@
+diff --git a/mtah/config.py b/mtah/config.py
+index d019da3..e056f78 100644
+--- a/mtah/config.py
++++ b/mtah/config.py
+@@ -79,6 +79,31 @@ class PipelineConfig:
+     # own proxy for control. One touch alone (a deflection, a duel) never switches possession.
+     possession_switch_consecutive_touches: int = 2
+ 
++    # --- Viterbi decoder (decode_viterbi.py) -----------------------------------------------
++    # Per-frame scores are additive log-odds units; transition costs are paid once per change.
++    # A state change happens when the evidence collected for the new state outweighs its cost,
++    # so each cost reads as "how much evidence a change needs".
++    # Evidence for a team: each frame of clear control / clear touch adds this to that team.
++    viterbi_control_weight: float = 1.0
++    viterbi_touch_weight: float = 12.0
++    # Switching team. Two clear touches (a few frames each) or ~0.5 s of control should pay it;
++    # one stray touch should not.
++    viterbi_switch_cost: float = 20.0
++    # Entering and leaving dead ball. With the per-frame untracked-ball weight below, a gap must
++    # be about (enter + exit) / weight frames long to become dead: 20 / 0.4 = 50 frames = 2 s,
++    # the 002 threshold — but now other evidence can outweigh it.
++    viterbi_enter_dead_cost: float = 10.0
++    viterbi_exit_dead_cost: float = 10.0
++    viterbi_ball_untracked_dead_weight: float = 0.4
++    # A tracked ball is weak evidence of live play.
++    viterbi_ball_tracked_live_weight: float = 0.4
++    viterbi_ball_out_dead_weight: float = 2.0
++    viterbi_walking_dead_weight: float = 0.2
++    viterbi_set_piece_window_dead_weight: float = 1.0
++    # After a team-tagged set-piece restart, the tagged team is favoured for a short while
++    # (weight per frame, for this many frames).
++    viterbi_set_piece_team_weight: float = 2.0
++    viterbi_set_piece_team_frames: int = _seconds_to_frames(1.0)
+ 
+ 
+ DEFAULT_CONFIG = PipelineConfig()
+diff --git a/mtah/dead_ball.py b/mtah/dead_ball.py
+index 55233fa..5575aea 100644
+--- a/mtah/dead_ball.py
++++ b/mtah/dead_ball.py
+@@ -1,6 +1,7 @@
+ """Live / dead ball detector.
+ 
+-Entry point: detect_dead_ball.
++Entry points: detect_dead_ball (the rule decoder's OR of all cues), detect_dead_ball_signals
++(each cue separately, for the Viterbi decoder).
+ 
+ Signals, OR-ed per frame, then cleaned of very short runs:
+   1. ball tracked beyond a touchline or goal line;
+@@ -53,6 +54,36 @@ def detect_dead_ball(frame_features: domain.FrameFeatures, tagging: pd.DataFrame
+         is_dead, pipeline_config.live_min_duration_between_dead_frames)
+ 
+ 
++def detect_dead_ball_signals(frame_features: domain.FrameFeatures, tagging: pd.DataFrame,
++                             graded_halves: list[domain.GradedHalf],
++                             pipeline_config: config.PipelineConfig) -> domain.DeadBallSignals:
++    n_frames = len(frame_features.is_ball_tracked)
++    set_pieces = tagging[tagging["code"] == "set pieces"]
++    set_piece_starts = set_pieces["start_video_frame"].to_numpy(dtype=np.int64)
++    set_piece_restarts = np.array(
++        [_find_restart_video_frame(int(start), frame_features, pipeline_config)
++         for start in set_piece_starts], dtype=np.int64)
++    is_set_piece_window = np.zeros(n_frames, dtype=bool)
++    for tag_start_video_frame, restart_video_frame in zip(set_piece_starts, set_piece_restarts):
++        is_set_piece_window[tag_start_video_frame:restart_video_frame] = True
++
++    kick_off_starts = set_pieces.loc[set_pieces["set_piece_type"] == "kick off (start)",
++                                     "start_video_frame"].to_numpy()
++    is_before_kick_off = np.zeros(n_frames, dtype=bool)
++    for graded_half in graded_halves:
++        kick_off_restart_video_frame = _find_restart_video_frame(
++            _first_kick_off_tag_of_half(kick_off_starts, graded_half, pipeline_config),
++            frame_features, pipeline_config)
++        is_before_kick_off[graded_half.first_video_frame:kick_off_restart_video_frame] = True
++
++    return domain.DeadBallSignals(
++        is_walking_stoppage=_detect_collective_stoppages(frame_features, pipeline_config),
++        is_set_piece_window=is_set_piece_window,
++        is_before_kick_off=is_before_kick_off,
++        set_piece_restart_frames=set_piece_restarts,
++        set_piece_teams=set_pieces["team"].to_numpy(dtype=np.int8))
++
++
+ def _detect_collective_stoppages(frame_features: domain.FrameFeatures,
+                                  pipeline_config: config.PipelineConfig) -> domain.BoolPerFrame:
+     # NaN speeds compare False on both sides, so untracked frames are neither slow nor fast.
+diff --git a/mtah/domain.py b/mtah/domain.py
+index 2846d78..597cd13 100644
+--- a/mtah/domain.py
++++ b/mtah/domain.py
+@@ -57,6 +57,20 @@ class FrameFeatures:
+     median_player_speed_mps: FloatPerFrame
+ 
+ 
++@dataclass(frozen=True)
++class DeadBallSignals:
++    """Each dead-ball cue on its own, for decoders that weigh them rather than OR them.
++
++    set_piece_restart_frames / set_piece_teams: one entry per Smart Tagging set piece, the
++    estimated restart frame and the tagged team (NO_TEAM for throw-ins and untagged ones).
++    """
++    is_walking_stoppage: BoolPerFrame
++    is_set_piece_window: BoolPerFrame
++    is_before_kick_off: BoolPerFrame
++    set_piece_restart_frames: NDArray[np.int64]
++    set_piece_teams: NDArray[np.int8]
++
++
+ class ControlEpisode(NamedTuple):
+     """Consecutive frames of one team's control evidence; end_video_frame is exclusive."""
+     start_video_frame: int
+diff --git a/mtah/pipeline.py b/mtah/pipeline.py
+index c57be57..28534b6 100644
+--- a/mtah/pipeline.py
++++ b/mtah/pipeline.py
+@@ -10,15 +10,17 @@ from __future__ import annotations
+ 
+ import pandas as pd
+ 
+-from . import config, dead_ball, decode_rules, domain, evidence, features
++from . import config, dead_ball, decode_viterbi, domain, evidence, features
+ 
+ 
+ def label_possessions(tracking: domain.TrackingData, tagging: pd.DataFrame,
+                       graded_halves: list[domain.GradedHalf],
+                       pipeline_config: config.PipelineConfig) -> domain.LabelPerFrame:
+     frame_features = features.compute_frame_features(tracking, pipeline_config)
+-    is_dead = dead_ball.detect_dead_ball(frame_features, tagging, graded_halves, pipeline_config)
++    dead_ball_signals = dead_ball.detect_dead_ball_signals(frame_features, tagging, graded_halves,
++                                                           pipeline_config)
+     control_evidence = evidence.detect_control_evidence(frame_features, pipeline_config)
+     touch_evidence = evidence.detect_touch_evidence(frame_features, pipeline_config)
+-    return decode_rules.decode_possession_labels(control_evidence, touch_evidence, is_dead,
+-                                                 tagging, graded_halves, pipeline_config)
++    return decode_viterbi.decode_possession_labels(frame_features, control_evidence,
++                                                   touch_evidence, dead_ball_signals,
++                                                   graded_halves, pipeline_config)
+diff --git a/private/tmp/claude-501/-Users-shooker-Desktop-Desktop---Sean-s-MacBook-Pro-workspace-football-analytics-more-than-a-hack-2027/40fba40b-2bf5-46fb-9bbb-de6dd099ca9a/scratchpad/iter007/decode_viterbi.py b/mtah/decode_viterbi.py
+new file mode 100644
+index 0000000..778506d
+--- /dev/null
++++ b/mtah/decode_viterbi.py
+@@ -0,0 +1,126 @@
++"""Viterbi decoder: the most likely H / A / D sequence for each graded half.
++
++Entry point: decode_possession_labels.
++
++Each frame gives every state a score from the evidence on that frame (touches and control for
++a team; ball missing, out of play, players walking, set-piece windows for dead ball; a visible
++ball against dead ball). Every change of state pays a cost. The decoder picks the labelling with
++the highest total score minus costs over the whole half.
++
++This replaces the rule decoder's hard thresholds with one trade-off: a switch or a dead stretch
++happens only when the evidence for it outweighs its cost, and evidence of every kind adds up.
++Before each half's kick-off is forced dead (the scorer grades those frames as D). Ungraded
++frames are X.
++
++Known limitation (standard HMM): possession length has no explicit model, so very short
++possessions are only discouraged by the switch cost. A semi-Markov decoder would add a duration
++model if that turns out to matter.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from numpy.typing import NDArray
++
++from . import config, domain
++
++_HOME, _AWAY, _DEAD = 0, 1, 2
++_STATE_LABELS = np.array([domain.LABEL_HOME, domain.LABEL_AWAY, domain.LABEL_DEAD])
++# Large enough that no amount of evidence can outweigh it.
++_FORCED_SCORE = 1e6
++
++
++def decode_possession_labels(frame_features: domain.FrameFeatures,
++                             control_evidence: domain.TeamCodePerFrame,
++                             touch_evidence: domain.TeamCodePerFrame,
++                             dead_ball_signals: domain.DeadBallSignals,
++                             graded_halves: list[domain.GradedHalf],
++                             pipeline_config: config.PipelineConfig) -> domain.LabelPerFrame:
++    state_scores = _score_states_per_frame(frame_features, control_evidence, touch_evidence,
++                                           dead_ball_signals, pipeline_config)
++    transition_costs = _transition_cost_matrix(pipeline_config)
++    labels = np.full(len(control_evidence), domain.LABEL_ABSTAIN, dtype="<U1")
++    for graded_half in graded_halves:
++        half_slice = slice(graded_half.first_video_frame, graded_half.last_video_frame + 1)
++        best_states = _most_likely_state_sequence(state_scores[half_slice], transition_costs)
++        labels[half_slice] = _STATE_LABELS[best_states]
++    return labels
++
++
++def _score_states_per_frame(frame_features: domain.FrameFeatures,
++                            control_evidence: domain.TeamCodePerFrame,
++                            touch_evidence: domain.TeamCodePerFrame,
++                            dead_ball_signals: domain.DeadBallSignals,
++                            pipeline_config: config.PipelineConfig) -> NDArray[np.float64]:
++    """(n_frames, 3) scores for H, A, D. Only differences between states matter."""
++    scores = np.zeros((len(control_evidence), 3))
++    touch_starts = _touch_start_frames(touch_evidence,
++                                       pipeline_config.control_episode_max_gap_frames)
++    for team_state, team_code in ((_HOME, domain.HOME_TEAM), (_AWAY, domain.AWAY_TEAM)):
++        scores[:, team_state] += (pipeline_config.viterbi_control_weight
++                                  * (control_evidence == team_code))
++        scores[touch_starts[team_code], team_state] += pipeline_config.viterbi_touch_weight
++
++    is_tracked = frame_features.is_ball_tracked
++    scores[:, _DEAD] += (pipeline_config.viterbi_ball_untracked_dead_weight * ~is_tracked
++                         - pipeline_config.viterbi_ball_tracked_live_weight * is_tracked
++                         + pipeline_config.viterbi_ball_out_dead_weight
++                         * frame_features.is_ball_out_of_pitch
++                         + pipeline_config.viterbi_walking_dead_weight
++                         * dead_ball_signals.is_walking_stoppage
++                         + pipeline_config.viterbi_set_piece_window_dead_weight
++                         * dead_ball_signals.is_set_piece_window
++                         + _FORCED_SCORE * dead_ball_signals.is_before_kick_off)
++
++    team_tagged = dead_ball_signals.set_piece_teams != domain.NO_TEAM
++    for restart_frame, team_code in zip(dead_ball_signals.set_piece_restart_frames[team_tagged],
++                                        dead_ball_signals.set_piece_teams[team_tagged]):
++        team_state = _HOME if team_code == domain.HOME_TEAM else _AWAY
++        scores[restart_frame:restart_frame + pipeline_config.viterbi_set_piece_team_frames,
++               team_state] += pipeline_config.viterbi_set_piece_team_weight
++    return scores
++
++
++def _touch_start_frames(touch_evidence: domain.TeamCodePerFrame,
++                        max_gap_frames: int) -> dict[int, NDArray[np.int64]]:
++    """First frame of each touch, per team. A touch scores once, however many frames the ball
++    stays near the player: per-frame scoring let one long dribble outweigh an interception plus
++    a pass (two touches of a few frames each), so no single switch cost could accept the second
++    while rejecting scrambles. Frames of one team's evidence separated by a hole up to
++    max_gap_frames belong to the same touch."""
++    starts: dict[int, NDArray[np.int64]] = {}
++    for team_code in (domain.HOME_TEAM, domain.AWAY_TEAM):
++        team_frames = np.flatnonzero(touch_evidence == team_code)
++        is_new_touch = np.diff(team_frames, prepend=-max_gap_frames - 2) > max_gap_frames + 1
++        starts[team_code] = team_frames[is_new_touch]
++    return starts
++
++
++def _transition_cost_matrix(pipeline_config: config.PipelineConfig) -> NDArray[np.float64]:
++    """costs[from_state, to_state]. From dead ball either team can take over at the same cost,
++    so the restart team is decided by the evidence after it, not by who had the ball before."""
++    switch = pipeline_config.viterbi_switch_cost
++    enter_dead = pipeline_config.viterbi_enter_dead_cost
++    exit_dead = pipeline_config.viterbi_exit_dead_cost
++    return np.array([[0.0, switch, enter_dead],
++                     [switch, 0.0, enter_dead],
++                     [exit_dead, exit_dead, 0.0]])
++
++
++def _most_likely_state_sequence(state_scores: NDArray[np.float64],
++                                transition_costs: NDArray[np.float64]) -> NDArray[np.int64]:
++    """Standard Viterbi: best total up to each frame per state, then trace back. The loop is over
++    frames with 3x3 numpy steps — ~80k frames per half, a second or two."""
++    n_frames = len(state_scores)
++    best_previous_state = np.zeros((n_frames, 3), dtype=np.int8)
++    running_best = state_scores[0].copy()
++    for frame in range(1, n_frames):
++        candidate_totals = running_best[:, None] - transition_costs
++        best_previous_state[frame] = candidate_totals.argmax(axis=0)
++        running_best = candidate_totals.max(axis=0) + state_scores[frame]
++
++    best_states = np.zeros(n_frames, dtype=np.int64)
++    best_states[-1] = int(running_best.argmax())
++    for frame in range(n_frames - 1, 0, -1):
++        best_states[frame - 1] = best_previous_state[frame, best_states[frame]]
++    return best_states
