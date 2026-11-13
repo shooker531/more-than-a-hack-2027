@@ -5,11 +5,13 @@
 This is the number that decides whether an iteration is kept (ITERATIONS.md). It runs the exact
 labelling code the submission uses (mtah.pipeline.label_possessions) on three other matches whose
 tracking has been degraded to look like the challenge's, against possession labels derived from
-their human-annotated events. Results also go to evaluation/reports/validation_latest.json, which
+their human-annotated events. Leave-one-game-out: each game is scored with a possession model
+trained only on the other two, so no game is ever scored by a model that saw it. Results also go to evaluation/reports/validation_latest.json, which
 scripts/log_experiment.py records.
 
-main() reads top to bottom: for each game, load -> derive truth -> for each seed: degrade ->
-synthesise tags -> label (pipeline and baseline) -> then score everything and report.
+main() reads top to bottom: load every game and build its training examples -> for each game:
+train on the others -> derive truth -> for each seed: degrade -> synthesise tags -> label
+(pipeline and baseline) -> then score everything and report.
 
 Prerequisite (once): git clone https://github.com/metrica-sports/sample-data
 data/external/metrica-sample-data
@@ -23,9 +25,9 @@ import os
 import numpy as np
 
 import games
-from mtah import config, pipeline
+from mtah import config, pipeline, possession_model
 from validation import (degrade, event_labels, reference_baseline, sample_games, scoring,
-                        synthetic_tagging)
+                        synthetic_tagging, training_data)
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
@@ -38,9 +40,21 @@ _BOOTSTRAP_DRAWS = 1000
 
 
 def main(pipeline_config: config.PipelineConfig) -> None:
+    loaded_games = {game_number: sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR,
+                                                               _CACHE_DIR)
+                    for game_number in sample_games.SAMPLE_GAME_NUMBERS}
+    examples_by_game = {game_number: training_data.build_training_examples(sample_game,
+                                                                           pipeline_config)
+                        for game_number, sample_game in loaded_games.items()}
+
     truth_runs, pipeline_runs, baseline_runs, run_names = [], [], [], []
-    for game_number in sample_games.SAMPLE_GAME_NUMBERS:
-        sample_game = sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR, _CACHE_DIR)
+    for game_number, sample_game in loaded_games.items():
+        held_out_training = training_data.combine_training_examples(
+            [examples for other_game, examples in examples_by_game.items()
+             if other_game != game_number])
+        trained_model = possession_model.train_possession_model(
+            held_out_training.feature_rows, held_out_training.is_home_in_possession,
+            pipeline_config)
         truth = event_labels.derive_possession_labels(
             sample_game.events, sample_game.graded_halves, len(sample_game.tracking.ball_norm))
         for seed in _DEGRADATION_SEEDS:
@@ -49,7 +63,8 @@ def main(pipeline_config: config.PipelineConfig) -> None:
             tagging = synthetic_tagging.synthesize_set_piece_tags(
                 sample_game.events, sample_game.graded_halves, seed)
             pipeline_runs.append(pipeline.label_possessions(
-                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config))
+                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config,
+                trained_model))
             baseline_runs.append(reference_baseline.label_with_official_baseline(degraded_tracking))
             truth_runs.append(truth)
             run_names.append("game{}/seed{}".format(game_number, seed))

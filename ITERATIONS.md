@@ -10,7 +10,8 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
-| 008 | Recalibrate contest margin (1.0 m) and touch radius (1.5 m) | **0.578** | ✅ kept |
+| 009 | Learned possession model + Viterbi (leave-one-game-out) | **0.642** | ✅ kept |
+| 008 | Recalibrate contest margin (1.0 m) and touch radius (1.5 m) | 0.578 | ✅ kept |
 | — | *Harness fix: realistic ball error (006: 0.552, 005: 0.509, baseline: 0.330)* | — | — |
 | 007 | Viterbi decoder (hand-set scores) | 0.643 (vs 0.658) | ❌ rejected |
 | — | *Truth fix: controlled possession only (005: 0.638, 006: 0.658)* | — | — |
@@ -38,6 +39,25 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 009 — Learned possession model + Viterbi  ✅ KEPT
+
+**Problem:** the remaining errors were spread thin across many small causes, a sign the
+hand-written rules were near their ceiling.
+
+**Change:** a gradient-boosted model predicts P(home has the ball) on every live frame from 34
+features: ball evidence (distances, touches, control, ball speed) plus team structure and
+movement (how far up the pitch each team is, forward speed, width, length, pressing), averaged
+over ±0.25 s, ±1 s and ±2.5 s. A Viterbi decoder turns the probabilities into possessions, with
+one switch cost. Dead ball still comes from the rules. Trained on the sample games only;
+validation is leave-one-game-out, so no game is scored by a model that saw it.
+
+**Result:** 0.578 → **0.642** (intervals don't overlap), better in every game. Team structure
+and movement are worth about +0.04 on their own (ball features only: 0.604). Public 5 minutes
+(sanity only): 0.447 vs 0.332 for 006, with exactly 17 of 17 possessions.
+
+**Next:** game 3 gains least and the model under-predicts possessions there (260 vs 383).
+Smart Tagging build-up/progression tags as a feature, with realistic fake tags for the samples.
 
 ## 008 — Recalibrate contest margin and touch radius  ✅ KEPT
 

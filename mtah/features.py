@@ -1,6 +1,6 @@
 """Per-frame features from the tracking arrays, vectorised over all frames.
 
-Entry point: compute_frame_features.
+Entry points: compute_frame_features, centred_nan_mean (also used by model_features).
 
 All distances are computed in metres: the pitch is not square, so distances in normalised units
 would stretch the short axis and pick the wrong nearest player near the touchlines.
@@ -41,7 +41,7 @@ def compute_frame_features(tracking: domain.TrackingData,
                                                           tracking.slot_team, domain.HOME_TEAM),
         nearest_away_distance_m=_nearest_distance_of_team(player_to_ball_distance_m,
                                                           tracking.slot_team, domain.AWAY_TEAM),
-        median_player_speed_mps=_centred_nan_mean(
+        median_player_speed_mps=centred_nan_mean(
             median_player_speed_mps, pipeline_config.player_speed_smoothing_frames),
     )
 
@@ -75,7 +75,7 @@ def _nearest_distance_of_team(player_to_ball_distance_m: NDArray[np.float64],
         return np.nanmin(team_distances_m, axis=1)
 
 
-def _centred_nan_mean(values: domain.FloatPerFrame, window_frames: int) -> domain.FloatPerFrame:
+def centred_nan_mean(values: domain.FloatPerFrame, window_frames: int) -> domain.FloatPerFrame:
     """Cumulative sums keep the cost independent of the window size."""
     is_valid = ~np.isnan(values)
     cumulative_sum = np.concatenate(([0.0], np.cumsum(np.where(is_valid, values, 0.0))))

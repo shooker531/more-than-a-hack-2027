@@ -81,6 +81,25 @@ class PipelineConfig:
     # own proxy for control. One touch alone (a deflection, a duel) never switches possession.
     possession_switch_consecutive_touches: int = 2
 
+    # --- learned possession model + Viterbi decoder (possession_model.py, decode_viterbi.py) --
+    # Gradient-boosted trees predicting P(home has the ball) per live frame, trained on the
+    # sample games only. Settings are conventional, not tuned: moderate depth and learning rate
+    # with L2, because three training games make overfitting the main risk.
+    model_max_iterations: int = 300
+    model_learning_rate: float = 0.05
+    model_max_leaf_nodes: int = 31
+    model_l2_regularisation: float = 1.0
+    model_random_seed: int = 0
+    # Consecutive frames are near-duplicates; every 5th frame keeps the information at a fifth
+    # of the training cost.
+    model_training_frame_step: int = 5
+    # Viterbi over H/A inside live play: the log-probability evidence for the other team must
+    # outweigh this cost before possession switches. Leave-one-game-out: 5 -> 0.620,
+    # 10 -> 0.635, 20 -> 0.642, 40 -> 0.643; 20 is where gains flatten.
+    model_switch_cost: float = 20.0
+    # Probabilities are clipped so one overconfident frame cannot force a switch by itself.
+    model_probability_floor: float = 1e-3
+
 
 
 DEFAULT_CONFIG = PipelineConfig()

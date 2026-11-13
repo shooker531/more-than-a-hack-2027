@@ -1,0 +1,9 @@
+# Everything our pipeline (run.py, run_validation.py) needs, pinned so the submission regenerates
+# byte for byte. Install: uv pip install --python .venv -r requirements-mtah.txt
+numpy==2.4.6
+pandas==3.1.1
+scikit-learn==1.9.1
+scipy==1.17.1
+joblib==1.6.0
+threadpoolctl==3.8.0
+kloppy==3.18.0
