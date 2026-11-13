@@ -10,6 +10,8 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
+| 011 | Smart Tagging phase features | 0.647 (vs 0.642) | ❌ rejected |
+| 010 | Extra shape features (hull, lines, half share, ball position) | 0.644 (vs 0.642) | ❌ rejected |
 | 009 | Learned possession model + Viterbi (leave-one-game-out) | **0.642** | ✅ kept |
 | 008 | Recalibrate contest margin (1.0 m) and touch radius (1.5 m) | 0.578 | ✅ kept |
 | — | *Harness fix: realistic ball error (006: 0.552, 005: 0.509, baseline: 0.330)* | — | — |
@@ -39,6 +41,39 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 011 — Smart Tagging phase features  ❌ REJECTED
+
+**Idea:** build-up / progression tags agree with the possessing team ~88% of the time on our
+match (other phases ~64%), so give them to the model as two features.
+
+**Change:** fake phase tags for the sample games, matched to the real tags' coverage, team
+agreement, length and alignment with possession changes (all measured on our match without
+labels); two features, +1 home / −1 away / 0 untagged.
+
+**Result:** first version 0.652 (7/9 runs), but its fake tags lined up with possession changes
+more neatly than the real ones. Matched to real alignment: **0.647 vs 0.642, 6/9 runs** — noise.
+
+**Learned:** the tags are ~19 s windows over several possessions: they say who is attacking,
+which the tracking already shows, not when possession changes. The first, too-clean version
+would have looked like a gain — a reminder to check simulated inputs against the real ones.
+
+**Code:** `experiments/patches/011.patch`.
+
+## 010 — Extra shape features  ❌ REJECTED
+
+**Idea:** defending teams are compact and deep, attacking teams stretched and high. Added convex
+hull area (outfield players), defensive line (2nd-deepest player), press height (top 3 players),
+share of players in the opponent's half, and ball position along the pitch.
+
+**Result:** 0.644 vs 0.642; better on only 5 of 9 runs. Noise.
+
+**Learned (feature importance on held-out games):** ball evidence dominates (shuffling it costs
+21–25% frame accuracy). Shape does matter (~5–6% together) but the existing average position,
+width and length already carry it; defensive line and press height add nothing new. Shape helps
+say *who* has the ball mid-possession, not *when* it changes, and spellF1 scores the changes.
+
+**Code:** `experiments/patches/010.patch`.
 
 ## 009 — Learned possession model + Viterbi  ✅ KEPT
 

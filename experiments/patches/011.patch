@@ -1,0 +1,278 @@
+diff --git a/mtah/model_features.py b/mtah/model_features.py
+index 190ab27..0b308ec 100644
+--- a/mtah/model_features.py
++++ b/mtah/model_features.py
+@@ -8,6 +8,11 @@ both teams and cannot learn "home usually has the ball" from these three sample
+ positions are expressed in each team's attacking direction, inferred per half from where each
+ team's players stand on average (a team defends the half it mostly occupies) — no labels needed.
+ 
++Smart Tagging phases are two features: the team implied by the reliable build-up / progression
++tags (~88% agreement with the possessing team on the real match) and by the other attacking
++phases (~64%). Both are signed +1 home / -1 away / 0 untagged; the model learns how far to trust
++each from realistically noisy synthetic tags on the training games.
++
+ Missing values stay NaN; the gradient-boosted model handles them natively.
+ """
+ 
+@@ -16,6 +21,7 @@ from __future__ import annotations
+ import warnings
+ 
+ import numpy as np
++import pandas as pd
+ from numpy.typing import NDArray
+ 
+ from . import config, domain, features
+@@ -24,12 +30,16 @@ from . import config, domain, features
+ _CONTEXT_WINDOWS_FRAMES = (13, 51, 125)
+ _PRESSING_RADIUS_M = 5.0
+ _CENTROID_VELOCITY_SPAN_FRAMES = 25
++_RELIABLE_PHASE_CODES = ("build up", "progression")
++_OTHER_PHASE_CODES = ("creating chances", "ball in final third", "attacking transition",
++                      "long ball", "players in the box", "ball in the box", "goals")
+ 
+ _INSTANT_FEATURES = (
+     "nearest_home_m", "nearest_away_m", "nearest_difference_m", "ball_speed_mps",
+     "is_ball_tracked", "control_evidence", "touch_evidence",
+     "advance_difference_m", "forward_velocity_difference_mps", "width_difference_m",
+     "length_difference_m", "speed_difference_mps", "pressing_difference",
++    "reliable_phase_team", "other_phase_team",
+ )
+ _SMOOTHED_FEATURES = ("nearest_difference_m", "control_evidence", "touch_evidence",
+                       "advance_difference_m", "forward_velocity_difference_mps",
+@@ -41,7 +51,7 @@ FEATURE_NAMES = (list(_INSTANT_FEATURES)
+ 
+ def compute_model_features(tracking: domain.TrackingData, frame_features: domain.FrameFeatures,
+                            control_evidence: domain.TeamCodePerFrame,
+-                           touch_evidence: domain.TeamCodePerFrame,
++                           touch_evidence: domain.TeamCodePerFrame, tagging: pd.DataFrame,
+                            graded_halves: list[domain.GradedHalf]) -> NDArray[np.float32]:
+     """(n_frames, len(FEATURE_NAMES)) float32, NaN where a feature is undefined."""
+     players_x_m = tracking.players_norm[:, :, 0].astype(np.float64) * tracking.pitch_length_m
+@@ -79,6 +89,9 @@ def compute_model_features(tracking: domain.TrackingData, frame_features: domain
+         "length_difference_m": home["length_m"] - away["length_m"],
+         "speed_difference_mps": home["mean_speed_mps"] - away["mean_speed_mps"],
+         "pressing_difference": home["players_near_ball"] - away["players_near_ball"],
++        "reliable_phase_team": _phase_team_per_frame(tagging, _RELIABLE_PHASE_CODES,
++                                                     len(ball_x_m)),
++        "other_phase_team": _phase_team_per_frame(tagging, _OTHER_PHASE_CODES, len(ball_x_m)),
+     }
+     columns = [instant[name] for name in _INSTANT_FEATURES]
+     for window in _CONTEXT_WINDOWS_FRAMES:
+@@ -125,6 +138,24 @@ def _team_shape(team_x_m: NDArray[np.float64], team_y_m: NDArray[np.float64],
+     }
+ 
+ 
++def _phase_team_per_frame(tagging: pd.DataFrame, codes: tuple[str, ...],
++                          n_frames: int) -> domain.FloatPerFrame:
++    """Mean of +1 (home) / -1 (away) over the tags covering each frame, 0 where none do.
++    Overlapping tags for both teams cancel towards 0."""
++    phases = tagging[tagging["code"].isin(codes) & (tagging["team"] != domain.NO_TEAM)]
++    signed_sum = np.zeros(n_frames + 1)
++    tag_count = np.zeros(n_frames + 1)
++    signs = np.where(phases["team"].to_numpy() == domain.HOME_TEAM, 1.0, -1.0)
++    starts = phases["start_video_frame"].to_numpy()
++    ends = phases["end_video_frame"].to_numpy()
++    np.add.at(signed_sum, starts, signs)
++    np.add.at(signed_sum, ends, -signs)
++    np.add.at(tag_count, starts, 1.0)
++    np.add.at(tag_count, ends, -1.0)
++    coverage = np.cumsum(tag_count)[:n_frames]
++    return np.where(coverage > 0, np.cumsum(signed_sum)[:n_frames] / np.maximum(coverage, 1), 0.0)
++
++
+ def _signed_team_evidence(evidence: domain.TeamCodePerFrame) -> domain.FloatPerFrame:
+     return np.where(evidence == domain.HOME_TEAM, 1.0,
+                     np.where(evidence == domain.AWAY_TEAM, -1.0, 0.0))
+diff --git a/mtah/pipeline.py b/mtah/pipeline.py
+index a87b377..e9498b8 100644
+--- a/mtah/pipeline.py
++++ b/mtah/pipeline.py
+@@ -20,14 +20,14 @@ from . import (config, dead_ball, decode_viterbi, domain, evidence, features, mo
+ 
+ 
+ def compute_model_inputs(tracking: domain.TrackingData, frame_features: domain.FrameFeatures,
+-                         graded_halves: list[domain.GradedHalf],
++                         tagging: pd.DataFrame, graded_halves: list[domain.GradedHalf],
+                          pipeline_config: config.PipelineConfig) -> NDArray[np.float32]:
+     """The model's feature matrix for one match. Also used to build training examples, so
+     training and prediction see features computed the same way."""
+     return model_features.compute_model_features(
+         tracking, frame_features,
+         evidence.detect_control_evidence(frame_features, pipeline_config),
+-        evidence.detect_touch_evidence(frame_features, pipeline_config), graded_halves)
++        evidence.detect_touch_evidence(frame_features, pipeline_config), tagging, graded_halves)
+ 
+ 
+ def label_possessions(tracking: domain.TrackingData, tagging: pd.DataFrame,
+@@ -37,7 +37,7 @@ def label_possessions(tracking: domain.TrackingData, tagging: pd.DataFrame,
+     frame_features = features.compute_frame_features(tracking, pipeline_config)
+     is_dead = dead_ball.detect_dead_ball(frame_features, tagging, graded_halves, pipeline_config)
+     home_probability = possession_model.predict_home_probability(
+-        trained_model, compute_model_inputs(tracking, frame_features, graded_halves,
++        trained_model, compute_model_inputs(tracking, frame_features, tagging, graded_halves,
+                                             pipeline_config))
+     return decode_viterbi.decode_possession_labels(home_probability, is_dead, graded_halves,
+                                                    pipeline_config)
+diff --git a/run_validation.py b/run_validation.py
+index f98db7f..053b9bb 100644
+--- a/run_validation.py
++++ b/run_validation.py
+@@ -60,8 +60,8 @@ def main(pipeline_config: config.PipelineConfig) -> None:
+         for seed in _DEGRADATION_SEEDS:
+             degraded_tracking = degrade.degrade_tracking(
+                 sample_game.tracking, degrade.DEFAULT_DEGRADE_CONFIG, seed)
+-            tagging = synthetic_tagging.synthesize_set_piece_tags(
+-                sample_game.events, sample_game.graded_halves, seed)
++            tagging = synthetic_tagging.synthesize_tags(
++                sample_game.events, truth, sample_game.graded_halves, seed)
+             pipeline_runs.append(pipeline.label_possessions(
+                 degraded_tracking, tagging, sample_game.graded_halves, pipeline_config,
+                 trained_model))
+diff --git a/validation/synthetic_tagging.py b/validation/synthetic_tagging.py
+index 14e0d40..4ef59ec 100644
+--- a/validation/synthetic_tagging.py
++++ b/validation/synthetic_tagging.py
+@@ -1,10 +1,19 @@
+-"""Smart-Tagging-like set-piece tags for the sample games, synthesised from their events.
++"""Smart-Tagging-like tags for the sample games: set pieces from their events, phases of play from
++their possession truth.
+ 
+-Entry point: synthesize_set_piece_tags.
++Entry points: synthesize_tags (both), synthesize_set_piece_tags.
+ 
+-The pipeline reads only SET PIECES tags, so only those are produced, in the same columns as
+-mtah.load.load_tagging. They are made to share the real tags' imperfections, so validation does
+-not reward leaning on tags harder than the real ones allow:
++Same columns as mtah.load.load_tagging. Both kinds are made to share the real tags'
++imperfections, so validation does not reward leaning on tags harder than the real ones allow.
++
++Phase tags are matched to what the real match's tags look like (measured without labels,
++against our own predictions): "reliable" build-up/progression tags cover ~44% of live play,
++agree with the possessing team ~88% of the time, last ~19 s and start only loosely near a
++possession change (+1.6 s, IQR -2.6..4.2 s); "other" attacking phases cover ~66%, agree ~64%,
++last ~24 s and start -2.4 s (IQR -9.5..1.9 s). They span several possessions, so they are
++context, not switch markers.
++
++Set-piece tags:
+   - windows open ~3.5 s before the restart (measured on the challenge kick-offs), with jitter;
+   - throw-ins carry no team, as in the challenge export;
+   - a share of non-kick-off set pieces is dropped (the real tags are automatic, with misses).
+@@ -13,11 +22,13 @@ They have no false positives, so they remain somewhat cleaner than the real thin
+ 
+ from __future__ import annotations
+ 
++from typing import NamedTuple
++
+ import numpy as np
+ import pandas as pd
+ from numpy.typing import NDArray
+ 
+-from mtah import config, domain
++from mtah import config, domain, runs
+ 
+ # Tag windows open ~3.5 s before the restart (starter/01_smart_tagging.ipynb), +/- 1.5 s jitter,
+ # and extend a little past it.
+@@ -27,6 +38,76 @@ _TAG_LENGTH_AFTER_RESTART_FRAMES = round(1.5 * config.FRAMES_PER_SECOND)
+ _MISSED_SET_PIECE_SHARE = 0.10
+ 
+ 
++class _PhaseTagProfile(NamedTuple):
++    code: str
++    tags_per_possession: float
++    start_offset_median_s: float
++    start_offset_sd_s: float
++    length_median_s: float
++    length_log_sd: float
++    wrong_team_share: float
++    # Only possessions at least this long spawn tags; a window may run past the possession's end
++    # by at most |N(0, overrun_sd)| seconds.
++    min_possession_s: float
++    overrun_sd_s: float
++
++
++# Calibrated so the synthetic tags reproduce the real coverage and agreement on the sample games
++# (see the module docstring); the code names are the ones the model features look for.
++_RELIABLE_PHASES = _PhaseTagProfile("build up", 0.9, 1.6, 4.0, 18.7, 0.4, 0.04, 8.0, 5.0)
++_OTHER_PHASES = _PhaseTagProfile("ball in final third", 1.4, -2.4, 4.0, 23.9, 0.4, 0.20, 3.0,
++                                  8.0)
++
++
++def synthesize_tags(events: pd.DataFrame, possession_truth: domain.LabelPerFrame,
++                    graded_halves: list[domain.GradedHalf], seed: int) -> pd.DataFrame:
++    random_generator = np.random.default_rng(seed + 1000)
++    phase_tags = [_synthesize_phase_tags(possession_truth, graded_halves, profile,
++                                         random_generator)
++                  for profile in (_RELIABLE_PHASES, _OTHER_PHASES)]
++    return (pd.concat([synthesize_set_piece_tags(events, graded_halves, seed), *phase_tags],
++                      ignore_index=True)
++            .sort_values("start_video_frame", kind="stable").reset_index(drop=True))
++
++
++def _synthesize_phase_tags(possession_truth: domain.LabelPerFrame,
++                           graded_halves: list[domain.GradedHalf], profile: _PhaseTagProfile,
++                           random_generator: np.random.Generator) -> pd.DataFrame:
++    """Each true possession spawns a Poisson number of phase windows near its start, with the
++    measured offset and length spread; a share is attributed to the wrong team. Windows are
++    clipped to the half and are not aligned to the possession's end, as in the real export."""
++    rows = []
++    fps = config.FRAMES_PER_SECOND
++    team_code_by_label = {domain.LABEL_HOME: domain.HOME_TEAM, domain.LABEL_AWAY: domain.AWAY_TEAM,
++                          domain.LABEL_DEAD: domain.NO_TEAM, domain.LABEL_ABSTAIN: domain.NO_TEAM}
++    for graded_half in graded_halves:
++        half_start, half_end = graded_half.first_video_frame, graded_half.last_video_frame + 1
++        half_teams = np.array([team_code_by_label[label]
++                               for label in possession_truth[half_start:half_end]],
++                              dtype=np.int8)
++        eligible_spells = [(spell_start, spell_end, team) for spell_start, spell_end, team
++                           in runs.equal_value_runs(half_teams)
++                           if team != domain.NO_TEAM
++                           and spell_end - spell_start >= profile.min_possession_s * fps]
++        for spell_start, spell_end, team in eligible_spells:
++            for _ in range(int(random_generator.poisson(profile.tags_per_possession))):
++                start = half_start + spell_start + int(fps * random_generator.normal(
++                    profile.start_offset_median_s, profile.start_offset_sd_s))
++                latest_end = half_start + spell_end + int(
++                    fps * abs(random_generator.normal(0.0, profile.overrun_sd_s)))
++                length = min(int(fps * profile.length_median_s
++                                 * np.exp(random_generator.normal(0.0, profile.length_log_sd))),
++                             max(latest_end - start, fps))
++                is_wrong_team = random_generator.random() < profile.wrong_team_share
++                rows.append({"code": profile.code, "set_piece_type": "",
++                             "team": (1 - team) if is_wrong_team else team,
++                             "start_video_frame": int(np.clip(start, half_start, half_end - 1)),
++                             "end_video_frame": int(np.clip(start + length, half_start + 1,
++                                                            half_end))})
++    return pd.DataFrame(rows, columns=["code", "set_piece_type", "team", "start_video_frame",
++                                       "end_video_frame"]).astype({"team": np.int8})
++
++
+ def synthesize_set_piece_tags(events: pd.DataFrame, graded_halves: list[domain.GradedHalf],
+                               seed: int) -> pd.DataFrame:
+     random_generator = np.random.default_rng(seed)
+diff --git a/validation/training_data.py b/validation/training_data.py
+index fe0a5ed..6b13afb 100644
+--- a/validation/training_data.py
++++ b/validation/training_data.py
+@@ -16,7 +16,7 @@ import numpy as np
+ from numpy.typing import NDArray
+ 
+ from mtah import config, domain, features, pipeline
+-from validation import degrade, event_labels, sample_games
++from validation import degrade, event_labels, sample_games, synthetic_tagging
+ 
+ # Training always uses one fixed degradation; validation scores seeds 0-2 of games the model did
+ # not train on, so sharing seed 0 never leaks a scored game into training.
+@@ -35,9 +35,12 @@ def build_training_examples(sample_game: sample_games.SampleGame,
+     degraded_tracking = degrade.degrade_tracking(sample_game.tracking,
+                                                  degrade.DEFAULT_DEGRADE_CONFIG,
+                                                  TRAINING_DEGRADATION_SEED)
++    tagging = synthetic_tagging.synthesize_tags(sample_game.events, truth,
++                                                sample_game.graded_halves,
++                                                TRAINING_DEGRADATION_SEED)
+     feature_matrix = pipeline.compute_model_inputs(
+         degraded_tracking, features.compute_frame_features(degraded_tracking, pipeline_config),
+-        sample_game.graded_halves, pipeline_config)
++        tagging, sample_game.graded_halves, pipeline_config)
+     is_live = (truth == domain.LABEL_HOME) | (truth == domain.LABEL_AWAY)
+     sampled_frames = np.flatnonzero(is_live)[::pipeline_config.model_training_frame_step]
+     return TrainingExamples(feature_matrix[sampled_frames],
