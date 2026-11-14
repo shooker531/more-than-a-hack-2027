@@ -93,6 +93,10 @@ class PipelineConfig:
     # Consecutive frames are near-duplicates; every 5th frame keeps the information at a fifth
     # of the training cost.
     model_training_frame_step: int = 5
+    # Each training game is degraded this many times with different noise, so the model learns to
+    # ignore tracking error rather than one particular pattern of it. Copies add no new football,
+    # so the benefit flattens quickly.
+    model_training_degraded_copies: int = 1
     # Viterbi over H/A inside live play: the log-probability evidence for the other team must
     # outweigh this cost before possession switches. Leave-one-game-out: 5 -> 0.620,
     # 10 -> 0.635, 20 -> 0.642, 40 -> 0.643; 20 is where gains flatten.

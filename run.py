@@ -3,11 +3,12 @@
     .venv/bin/python run.py                              # evaluation/results/mtah_mvp.csv
     .venv/bin/python run.py --output path/to/team.csv
 
-main() reads top to bottom: load the match -> train the possession model on the public sample
-games -> label (mtah/pipeline.py lists the processing steps) -> write -> validate -> report.
+main() reads top to bottom: load the match -> train the possession model on the public labelled
+matches (Metrica samples + DFL open data) -> label (mtah/pipeline.py lists the processing steps)
+-> write -> validate -> report.
 
-Prerequisite (once): git clone https://github.com/metrica-sports/sample-data
-data/external/metrica-sample-data
+Prerequisites (once): the Metrica sample data in data/external/metrica-sample-data and the DFL
+open data in data/external/idsse — see README.
 """
 
 from __future__ import annotations
@@ -18,12 +19,13 @@ import sys
 
 import games
 from mtah import config, load, pipeline, possession_model, write
-from validation import sample_games, training_data
+from validation import labelled_games, training_data
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_OUTPUT_PATH = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
 _CACHE_DIR = os.path.join(games.DATA_DIR, "cache")
 _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
+_DFL_DATA_DIR = os.path.join(games.DATA_DIR, "external", "idsse")
 _SAMPLE_CACHE_DIR = os.path.join(games.DATA_DIR, "cache", "validation")
 
 
@@ -33,10 +35,9 @@ def main(output_path: str, pipeline_config: config.PipelineConfig) -> None:
     graded_halves = load.load_graded_halves(games.GAME)
 
     training_examples = training_data.combine_training_examples([
-        training_data.build_training_examples(
-            sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR, _SAMPLE_CACHE_DIR),
-            pipeline_config)
-        for game_number in sample_games.SAMPLE_GAME_NUMBERS])
+        training_data.build_training_examples(game, pipeline_config)
+        for game in labelled_games.load_all_labelled_games(_SAMPLE_DATA_DIR, _DFL_DATA_DIR,
+                                                           _SAMPLE_CACHE_DIR)])
     trained_model = possession_model.train_possession_model(
         training_examples.feature_rows, training_examples.is_home_in_possession, pipeline_config)
 

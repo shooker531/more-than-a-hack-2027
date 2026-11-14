@@ -1,6 +1,6 @@
 """Make sample-game tracking look like the challenge's automatic tracking. Seeded, so repeatable.
 
-Entry points: DegradeConfig, DEFAULT_DEGRADE_CONFIG, degrade_tracking.
+Entry points: DegradeConfig, DEFAULT_DEGRADE_CONFIG, degrade_labelled_game, degrade_tracking.
 
 The ball is left as it is. Measured on the sample games, the ball is already missing on 32-41% of
 frames (challenge: 41%), in ~160 gaps (challenge: 150), and the gaps line up with stoppages the
@@ -19,7 +19,8 @@ import dataclasses
 import numpy as np
 from numpy.typing import NDArray
 
-from mtah import config, domain
+from mtah import config, domain, runs
+from validation import labelled_games
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,11 +48,51 @@ class DegradeConfig:
     # The real ball barely wobbles (|acceleration| p50 0.01 m/frame^2), so its error must curve
     # gently: averaged twice over this window, not once.
     ball_noise_smoothing_frames: int = 50
+    # Sources whose ball is tracked on every frame (DFL/TRACAB) lose it the way an optical
+    # tracker does, measured on the Metrica games: whole dead stretches lose it 96.8% of the time;
+    # in live play ~1.27 gaps per minute cover 8.8% of frames — half are a few frames (brief
+    # occlusions), half last seconds (heavy tail: 10% over 10 s).
+    dead_stretch_ball_lost_share: float = 0.97
+    live_ball_gaps_per_minute: float = 1.27
+    live_ball_gap_short_share: float = 0.5
+    live_ball_gap_long_median_s: float = 4.0
+    live_ball_gap_long_log_sd: float = 1.2
     # Speeds are derived from positions over this centred window, as a tracker would smooth them.
     speed_window_frames: int = 5
 
 
 DEFAULT_DEGRADE_CONFIG = DegradeConfig()
+
+
+def degrade_labelled_game(game: labelled_games.LabelledGame, degrade_config: DegradeConfig,
+                          seed: int) -> domain.TrackingData:
+    tracking = (_remove_ball_like_optical_tracker(game.tracking, game.truth, degrade_config,
+                                                  np.random.default_rng(seed + 5000))
+                if game.is_ball_always_tracked else game.tracking)
+    return degrade_tracking(tracking, degrade_config, seed)
+
+
+def _remove_ball_like_optical_tracker(tracking: domain.TrackingData,
+                                      truth: domain.LabelPerFrame, degrade_config: DegradeConfig,
+                                      random_generator: np.random.Generator
+                                      ) -> domain.TrackingData:
+    is_ball_lost = np.zeros(len(truth), dtype=bool)
+    for start, end in runs.true_runs(truth == domain.LABEL_DEAD):
+        is_ball_lost[start:end] = (random_generator.random()
+                                   < degrade_config.dead_stretch_ball_lost_share)
+    live_frames = np.flatnonzero((truth == domain.LABEL_HOME) | (truth == domain.LABEL_AWAY))
+    n_gaps = random_generator.poisson(degrade_config.live_ball_gaps_per_minute * len(live_frames)
+                                      / (60 * config.FRAMES_PER_SECOND))
+    for gap_start in random_generator.choice(live_frames, size=n_gaps, replace=False):
+        is_short = random_generator.random() < degrade_config.live_ball_gap_short_share
+        length = (int(random_generator.integers(1, 6)) if is_short
+                  else int(config.FRAMES_PER_SECOND * degrade_config.live_ball_gap_long_median_s
+                           * np.exp(random_generator.normal(0.0,
+                                                            degrade_config.live_ball_gap_long_log_sd))))
+        is_ball_lost[gap_start:gap_start + length] = True
+    ball_norm = tracking.ball_norm.copy()
+    ball_norm[is_ball_lost] = np.nan
+    return dataclasses.replace(tracking, ball_norm=ball_norm)
 
 
 def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: DegradeConfig,

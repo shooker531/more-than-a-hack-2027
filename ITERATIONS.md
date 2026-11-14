@@ -10,6 +10,8 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
+| 012 | Train on 7 extra Bundesliga matches (DFL open data) | **0.629** (vs 0.618) | ✅ kept |
+| — | *Harness: 10 matches (3 Metrica + 7 DFL); 009 re-scored 0.618, baseline 0.312* | — | — |
 | 011 | Smart Tagging phase features | 0.647 (vs 0.642) | ❌ rejected |
 | 010 | Extra shape features (hull, lines, half share, ball position) | 0.644 (vs 0.642) | ❌ rejected |
 | 009 | Learned possession model + Viterbi (leave-one-game-out) | **0.642** | ✅ kept |
@@ -41,6 +43,26 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 012 — Train on 7 extra Bundesliga matches  ✅ KEPT
+
+**Problem:** the model learned from only 3 games, its biggest weakness. Extra noisy copies of
+the same games didn't help (1 → 3 → 5 copies: 0.642 → 0.647 → 0.647): they add no new football.
+
+**Change:** added the IDSSE / DFL open data (7 Bundesliga matches, TRACAB tracking at 25 Hz,
+CC-BY 4.0). Its tracking carries per-frame ball possession and ball status, like the corrected
+tracking behind the challenge's answer key. That flag flips on every touch (37% of spells under
+2 s), so the controlled-possession rule (≥ 2 s) is applied: the result matches the public answer
+key's shape (median 6.9 s vs 7.6 s). The ball is removed the way our tracker loses it (dead
+stretches, plus live gaps calibrated on Metrica); the degraded data then matches our real match on
+the realism statistics. Validation now covers all 10 matches, leave-one-game-out.
+
+**Result:** pure held-out first — 009, trained on Metrica only, scored 0.57–0.64 on the unseen
+Bundesliga matches, so it already transferred. Training on all other matches: 0.618 → **0.629**,
+better on 22 of 30 runs and 8 of 10 matches (Bundesliga matches up to +0.030). Baseline 0.312.
+Public 5 minutes (sanity only): 0.497 vs 0.447 for 009, 16 of 17 possessions.
+
+**Full-match sanity:** 268 possessions, median 7.8 s, mean 12.5 s.
 
 ## 011 — Smart Tagging phase features  ❌ REJECTED
 

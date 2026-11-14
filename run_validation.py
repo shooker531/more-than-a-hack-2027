@@ -26,11 +26,12 @@ import numpy as np
 
 import games
 from mtah import config, pipeline, possession_model
-from validation import (degrade, event_labels, reference_baseline, sample_games, scoring,
-                        synthetic_tagging, training_data)
+from validation import (degrade, labelled_games, reference_baseline, scoring, synthetic_tagging,
+                        training_data)
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
+_DFL_DATA_DIR = os.path.join(games.DATA_DIR, "external", "idsse")
 _CACHE_DIR = os.path.join(games.DATA_DIR, "cache", "validation")
 _RESULTS_PATH = os.path.join(_REPO_ROOT, "evaluation", "reports", "validation_latest.json")
 # Degradation is random (player dropouts, noise, tag jitter); several seeds per game average
@@ -40,34 +41,29 @@ _BOOTSTRAP_DRAWS = 1000
 
 
 def main(pipeline_config: config.PipelineConfig) -> None:
-    loaded_games = {game_number: sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR,
-                                                               _CACHE_DIR)
-                    for game_number in sample_games.SAMPLE_GAME_NUMBERS}
-    examples_by_game = {game_number: training_data.build_training_examples(sample_game,
-                                                                           pipeline_config)
-                        for game_number, sample_game in loaded_games.items()}
+    validation_games = labelled_games.load_all_labelled_games(_SAMPLE_DATA_DIR, _DFL_DATA_DIR,
+                                                              _CACHE_DIR)
+    examples_by_game = {game.name: training_data.build_training_examples(game, pipeline_config)
+                        for game in validation_games}
 
     truth_runs, pipeline_runs, baseline_runs, run_names = [], [], [], []
-    for game_number, sample_game in loaded_games.items():
+    for game in validation_games:
         held_out_training = training_data.combine_training_examples(
             [examples for other_game, examples in examples_by_game.items()
-             if other_game != game_number])
+             if other_game != game.name])
         trained_model = possession_model.train_possession_model(
             held_out_training.feature_rows, held_out_training.is_home_in_possession,
             pipeline_config)
-        truth = event_labels.derive_possession_labels(
-            sample_game.events, sample_game.graded_halves, len(sample_game.tracking.ball_norm))
         for seed in _DEGRADATION_SEEDS:
-            degraded_tracking = degrade.degrade_tracking(
-                sample_game.tracking, degrade.DEFAULT_DEGRADE_CONFIG, seed)
-            tagging = synthetic_tagging.synthesize_set_piece_tags(
-                sample_game.events, sample_game.graded_halves, seed)
+            degraded_tracking = degrade.degrade_labelled_game(game, degrade.DEFAULT_DEGRADE_CONFIG,
+                                                              seed)
+            tagging = synthetic_tagging.synthesize_restart_tags(game.truth, game.graded_halves,
+                                                                seed)
             pipeline_runs.append(pipeline.label_possessions(
-                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config,
-                trained_model))
+                degraded_tracking, tagging, game.graded_halves, pipeline_config, trained_model))
             baseline_runs.append(reference_baseline.label_with_official_baseline(degraded_tracking))
-            truth_runs.append(truth)
-            run_names.append("game{}/seed{}".format(game_number, seed))
+            truth_runs.append(game.truth)
+            run_names.append("{}/seed{}".format(game.name, seed))
 
     per_run_scores: list[dict[str, object]] = [
         {"run": name,
@@ -82,27 +78,38 @@ def main(pipeline_config: config.PipelineConfig) -> None:
         "baseline": scoring.score_labels(pooled_truth, scoring.concatenate_label_runs(
             baseline_runs), _BOOTSTRAP_DRAWS),
     }
-    _write_results(per_run_scores, pooled_scores)
-    _print_report(per_run_scores, pooled_scores)
+    pooled_by_source = {
+        source: scoring.score_labels(
+            scoring.concatenate_label_runs([truth for name, truth in zip(run_names, truth_runs)
+                                            if name.startswith(source)]),
+            scoring.concatenate_label_runs([labels for name, labels
+                                            in zip(run_names, pipeline_runs)
+                                            if name.startswith(source)]), 0)
+        for source in ("metrica", "dfl")}
+    _write_results([game.name for game in validation_games], per_run_scores, pooled_scores,
+                   pooled_by_source)
+    _print_report(per_run_scores, pooled_scores, pooled_by_source)
 
 
-def _write_results(per_run_scores: list[dict[str, object]],
-                   pooled_scores: dict[str, dict[str, float]]) -> None:
+def _write_results(game_names: list[str], per_run_scores: list[dict[str, object]],
+                   pooled_scores: dict[str, dict[str, float]],
+                   pooled_by_source: dict[str, dict[str, float]]) -> None:
     os.makedirs(os.path.dirname(_RESULTS_PATH), exist_ok=True)
     with open(_RESULTS_PATH, "w") as handle:
-        json.dump({"games": list(sample_games.SAMPLE_GAME_NUMBERS),
-                   "seeds": list(_DEGRADATION_SEEDS),
-                   "pooled": pooled_scores, "per_run": per_run_scores}, handle, indent=2)
+        json.dump({"games": game_names, "seeds": list(_DEGRADATION_SEEDS),
+                   "pooled": pooled_scores, "pooled_by_source": pooled_by_source,
+                   "per_run": per_run_scores}, handle, indent=2)
 
 
 def _print_report(per_run_scores: list[dict[str, object]],
-                  pooled_scores: dict[str, dict[str, float]]) -> None:
-    print("{:<14} {:>10} {:>10} {:>10} {:>10} {:>12}".format(
+                  pooled_scores: dict[str, dict[str, float]],
+                  pooled_by_source: dict[str, dict[str, float]]) -> None:
+    print("{:<18} {:>10} {:>10} {:>10} {:>10} {:>12}".format(
         "run", "spellF1", "base", "macroF1", "base", "poss pred/gt"))
     for row in per_run_scores:
         ours, theirs = row["pipeline"], row["baseline"]
         assert isinstance(ours, dict) and isinstance(theirs, dict)
-        print("{:<14} {:>10.3f} {:>10.3f} {:>10.3f} {:>10.3f} {:>7.0f}/{:<5.0f}".format(
+        print("{:<18} {:>10.3f} {:>10.3f} {:>10.3f} {:>10.3f} {:>7.0f}/{:<5.0f}".format(
             str(row["run"]), ours["spell_f1"], theirs["spell_f1"], ours["macro_f1"],
             theirs["macro_f1"], ours["predicted_possessions"], ours["true_possessions"]))
     print()
@@ -113,6 +120,10 @@ def _print_report(per_run_scores: list[dict[str, object]],
                   scores["macro_f1"], scores["alive_dead_f1"],
                   scores["team_accuracy_when_alive"], scores["predicted_possessions"],
                   scores["true_possessions"]))
+    for source, scores in pooled_by_source.items():
+        print("  {:<8} spellF1 {:.3f}  possessions {:.0f}/{:.0f}".format(
+            source, scores["spell_f1"], scores["predicted_possessions"],
+            scores["true_possessions"]))
     print("\nwrote", os.path.relpath(_RESULTS_PATH, _REPO_ROOT))
 
 
