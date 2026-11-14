@@ -10,6 +10,7 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
+| 013 | Also train on 20 SkillCorner A-League matches | 0.595 (vs 0.629) | ❌ rejected |
 | 012 | Train on 7 extra Bundesliga matches (DFL open data) | **0.629** (vs 0.618) | ✅ kept |
 | — | *Harness: 10 matches (3 Metrica + 7 DFL); 009 re-scored 0.618, baseline 0.312* | — | — |
 | 011 | Smart Tagging phase features | 0.647 (vs 0.642) | ❌ rejected |
@@ -43,6 +44,27 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 013 — Also train on 20 SkillCorner A-League matches  ❌ REJECTED
+
+**Idea:** 012 showed more real matches help, so add SkillCorner's open data (20 A-League
+2024/25 matches, per-frame team possession) as training data only, validating on the same 10.
+
+**Change:** loader resamples 10 → 25 fps; "no team in possession" = dead ball (45% dead,
+in line with DFL's 42%); controlled rule gives a truth shaped like the answer key (under 2 s:
+12% vs 12%; median 7.4 s vs 7.6 s).
+
+**Result:** 0.629 → **0.595**, better on only 1 of 30 runs. The realism check predicted it: this
+is broadcast tracking (off-screen players extrapolated, resampled from 10 fps), so players look
+faster (median speed 1.79 vs 1.38 m/s real) and the ball sits further from them (within 1 m
+19% vs 28.5%). At two thirds of the training rows, it pulled the model towards the wrong kind
+of data.
+
+**Learned:** more data helps only when it resembles what you predict on — DFL's optical
+tracking did, broadcast tracking doesn't.
+
+**Code:** `experiments/patches/013.patch` (not in `experiments.csv`: run as a separate
+comparison script, so the log script's numbers would not apply).
 
 ## 012 — Train on 7 extra Bundesliga matches  ✅ KEPT
 
