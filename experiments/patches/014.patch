@@ -1,0 +1,200 @@
+diff --git a/validation/degrade.py b/validation/degrade.py
+index dfbe9b9..11daf92 100644
+--- a/validation/degrade.py
++++ b/validation/degrade.py
+@@ -48,6 +48,10 @@ class DegradeConfig:
+     # The real ball barely wobbles (|acceleration| p50 0.01 m/frame^2), so its error must curve
+     # gently: averaged twice over this window, not once.
+     ball_noise_smoothing_frames: int = 50
++    # The challenge tracker smooths the ball heavily: its 0.2 s velocity changes have p90 3.6 m/s and
++    # p99 7.4 m/s, vs 6-7 and 18-21 m/s on the clean sample balls. A centred average over this many
++    # frames, before the noise is added, reproduces that (p90 ~3.4, p99 ~7).
++    ball_position_smoothing_frames: int = 21
+     # Sources whose ball is tracked on every frame (DFL/TRACAB) lose it the way an optical
+     # tracker does, measured on the Metrica games: whole dead stretches lose it 96.8% of the time;
+     # in live play ~1.27 gaps per minute cover 8.8% of frames — half are a few frames (brief
+@@ -109,6 +113,9 @@ def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: Degrad
+     players_norm[:, :, 2] = _speed_from_positions_mps(players_norm, clean_tracking,
+                                                       degrade_config.speed_window_frames)
+     ball_norm = clean_tracking.ball_norm.astype(np.float64).copy()
++    for axis in (0, 1):
++        ball_norm[:, axis] = _centred_mean_where_tracked(
++            ball_norm[:, axis], degrade_config.ball_position_smoothing_frames)
+     pitch_size_m = np.array([clean_tracking.pitch_length_m, clean_tracking.pitch_width_m])
+     ball_error_m = (_twice_smoothed_unit_noise((len(ball_norm), 2),
+                                                degrade_config.ball_noise_smoothing_frames,
+@@ -146,6 +153,20 @@ def _twice_smoothed_unit_noise(shape: tuple[int, int], smoothing_frames: int,
+     return twice / twice.std(axis=0)
+ 
+ 
++def _centred_mean_where_tracked(values: NDArray[np.float64],
++                                window_frames: int) -> NDArray[np.float64]:
++    """Untracked frames stay NaN; tracked frames average only the tracked frames around them."""
++    is_tracked = ~np.isnan(values)
++    cumulative_sum = np.concatenate(([0.0], np.cumsum(np.where(is_tracked, values, 0.0))))
++    cumulative_count = np.concatenate(([0], np.cumsum(is_tracked)))
++    frame_index = np.arange(len(values))
++    window_start = np.maximum(0, frame_index - window_frames // 2)
++    window_end = np.minimum(len(values), frame_index + window_frames // 2 + 1)
++    count = cumulative_count[window_end] - cumulative_count[window_start]
++    return np.where(is_tracked, (cumulative_sum[window_end] - cumulative_sum[window_start])
++                    / np.maximum(count, 1), np.nan)
++
++
+ def _player_dropout_mask(n_frames: int, n_slots: int, degrade_config: DegradeConfig,
+                          random_generator: np.random.Generator) -> NDArray[np.bool_]:
+     """Independent dropout runs per slot until each slot has lost its target share of frames.
+diff --git a/Beyond_XI.md b/Beyond_XI.md
+new file mode 100644
+index 0000000..bf0af6e
+--- /dev/null
++++ b/Beyond_XI.md
+@@ -0,0 +1,148 @@
++# Beyond XI — Ball possession labelling (More Than A Hack 2027, Phase 1)
++
++**Submission:** `Beyond_XI.csv` (199,319 rows, passes `validate_submission.py`)
++**Code:** this repository; one command regenerates the file byte for byte (see *Reproduction*).
++
++## 1. Approach in brief
++
++The pipeline labels each frame in three steps:
++
++1. **Dead ball (rules).** A frame is `D` when the ball is beyond a line, when the ball has been
++   untracked for 2 s or more, when players collectively walk (median speed below 1 m/s) for 2 s or
++   more, inside a Smart Tagging set-piece window until the restart kick, and before each half's
++   kick-off.
++2. **Who has the ball (learned).** A gradient-boosted tree classifier (scikit-learn
++   `HistGradientBoostingClassifier`) predicts P(home in possession) on every live frame from 34
++   home-minus-away features:
++   - *ball evidence*: each team's nearest-player distance; **touch** (a player within 1.5 m of the
++     tracked ball at any speed, at least 1 m nearer than any opponent); **control** (within 2 m of
++     a ball slower than 7 m/s, same margin); ball speed;
++   - *team structure and movement*, in each team's attacking direction (inferred per half without
++     labels): centroid advance, centroid forward velocity, width, length, mean speed, players
++     within 5 m of the ball;
++   - centred averages of these over ±0.25 s, ±1 s and ±2.5 s.
++3. **Possessions (Viterbi).** Inside each live stretch a two-state Viterbi decoder turns the
++   per-frame log-probabilities into a home/away sequence, paying a fixed cost for every change of
++   team. Possession changes only when the model is confidently on the other side for long
++   enough, and the change lands where the evidence turns.
++
++The model is trained only on public matches from other competitions (Section 3). No label of the
++challenge match is used for training, tuning or validation.
++
++**Why this design.** The ranking metric (spellF1) rewards correct possession boundaries, not
++per-frame accuracy, so we built a validation harness that measures spellF1 on matches with known
++possession and kept only changes that improved it consistently. We started from hand-written rules
++(nearest player, control duration, consecutive touches); the learned model with Viterbi decoding
++replaced them once it beat them on held-out matches (validation spellF1 0.578 → 0.642 on the
++original three matches).
++
++## 2. Assets used and dropped
++
++| Asset | Used? | How / why not |
++|---|---|---|
++| Tactical automatic tracking (ATD) | **Yes** | all features; the ball's absence is the main dead-ball cue |
++| Smart Tagging — set pieces | **Yes** | dead-ball windows before restarts; kick-off timing |
++| Smart Tagging — phases of play | Tried, dropped | build-up/progression tags agree with the possessing team ~88% of the time, but they are ~19 s windows spanning several possessions; with realistically aligned synthetic tags on the training matches they gave no gain (0.647 vs 0.642) |
++| Homography | No | only needed to project onto video |
++| Tactical and broadcast video | No | the video files were not part of our download, and our error analysis showed most remaining errors occur with the ball tracked |
++| Broadcast tracking | No | different timeline, no mapping to the tactical frames |
++
++## 3. Training and validation data
++
++All labelled data is from **other matches**, publicly available; nothing was hand-labelled by us.
++
++| Source | Matches | Possession truth | Used for |
++|---|---|---|---|
++| Metrica Sports sample data (github.com/metrica-sports/sample-data) | 3 | derived from Metrica's human-annotated events | training + validation |
++| IDSSE / DFL open data (Bassek et al. 2025, *Scientific Data*, CC-BY 4.0, data owner Deutsche Fußball Liga) | 7 Bundesliga | the tracking's own per-frame `BallPossession` / `BallStatus` | training + validation |
++| SkillCorner open data | 20 A-League | per-frame team possession | tried as training data, dropped (Section 5) |
++
++**Controlled possession.** Both raw truths flip on every touch (DFL: 37% of spells under 2 s). Following
++CHALLENGE.md ("a simple touch without control" is not a change of possession), a new team's spell
++counts only if it shows control: 2 s of live play, or, for the event-based Metrica truth, a
++completed pass, carry, shot or set piece. Otherwise it merges back into the previous possession.
++The resulting possession lengths match the shape of the public 5-minute answer key (median 6.9–7.3 s
++vs 7.6 s; under 2 s: 5–13% vs 12%). The public answer key was used only for this shape check and for
++format/alignment checks, never to choose between versions.
++
++**Making the public data look like the challenge tracking.** Training and validation tracking is
++degraded so that label-free statistics match the challenge match: smoothly drifting player error and
++dropouts; a drifting ball offset (~0.8 m) with small jitter; and, for the always-tracked DFL ball,
++ball loss on dead stretches and in short live gaps calibrated on Metrica's real gaps. We check
++ball-tracked share, ball-to-player distances, touch and control rates and stoppage behaviour against
++the real match (`scripts/compare_harness_realism.py`).
++
++**Validation protocol.** Leave-one-game-out over the 10 matches: each match is scored by a model trained
++on the other nine, with three degradation seeds, using the organisers' own metric code. A change was
++kept only if bootstrap intervals did not overlap or it improved nearly every held-out match.
++
++## 4. Possession rules implemented
++
++- **Loose and contested balls** stay with the last team in possession. Evidence only counts for a team
++  whose player is at least 1 m nearer the ball than any opponent; in duels and tight marking no team gets
++  evidence.
++- **A touch is not possession.** One touch or deflection rarely outweighs the decoder's switch cost; a
++  sustained run of evidence (control, consecutive touches, team movement) does.
++- **Restarts.** Dead ball lasts until the restart kick; after a dead stretch either team may take
++  possession at no extra cost, decided by the evidence that follows.
++- **Dead ball is never possession.** Before each half's kick-off is always `D`.
++- **Abstention.** We never write `X` on graded frames; ungraded frames are `X`.
++
++## 5. Results and what we learned
++
++| | Validation spellF1 (10 matches, leave-one-game-out) |
++|---|---|
++| Official baseline (nearest player, ±2 s vote) | 0.312 |
++| Our rule-based decoder (iteration 008, on 3 matches) | 0.578 |
++| Learned model + Viterbi, trained on Metrica only | 0.618 |
++| **Submitted: learned model + Viterbi, Metrica + DFL** | **0.629** |
++
++On the public 5-minute window (sanity only, 17 possessions) the submitted pipeline scores 0.497
++against the baseline's 0.326.
++
++Experiments that did not improve validation, kept as patches in `experiments/patches/`: trimming
++dead-ball gaps at restarts; keeping open-play ball gaps live; hand-weighted Viterbi scores; extra shape
++features (convex hull, defensive line, press height); Smart Tagging phase features; extra noisy copies of
++the training matches; SkillCorner broadcast tracking as training data (0.595 — its extrapolated
++broadcast positions look unlike a tactical camera); evidence-dependent switch costs from a learned switch
++model (0.636, within noise); boundary-weighted training; shorter feature windows. The full log with every
++number is in `ITERATIONS.md`.
++
++**Where the headroom is.** Replacing our dead-ball labels with the truth on the validation matches lifts
++spellF1 only to 0.666; replacing our team labels lifts it to 0.930. Of true open-play turnovers, 46% have no
++predicted switch within 5 s: they are short opponent possessions (won and lost within a few seconds) that
++the noisy ball evidence does not reveal. Long wrong-team stretches are rare (2% of live frames) and false
++switches are 13% of predicted switches.
++
++## 6. Limitations
++
++- **Short possessions are under-detected** (validation: 6,976 predicted vs 8,958 true possessions). We
++  attacked this through the decoder, the training emphasis and the features; none moved it beyond noise.
++  Better ball information (e.g. ball detection from video) is the likely route.
++- **Dead ball is over-predicted.** 47% of the challenge match is labelled `D`; an indirect estimate puts
++  the true share near 34%. On validation, 4.3% of frames are called dead while live, mostly long ball gaps
++  during live play.
++- **Validation truth is an approximation** of the organisers' corrected-tracking labels, built with our
++  controlled-possession rule.
++- **Small data.** Ten labelled matches from two providers; the degradation of their tracking is simulated,
++  though checked against the real match.
++
++## 7. Reproduction
++
++```bash
++uv venv --python 3.11 .venv
++uv pip install --python .venv -r requirements-mtah.txt
++# challenge bundle unpacked into data/tactical/  (see data/README.md)
++bash scripts/download_public_data.sh                     # Metrica + DFL open data, ~2.9 GB
++.venv/bin/python run.py --output Beyond_XI.csv          # trains, labels, validates
++.venv/bin/python run_validation.py                       # optional: leave-one-game-out validation
++```
++
++Deterministic: the same inputs give the same bytes (fixed seeds, single model).
++
++## 8. Tools and AI assistance
++
++Python 3.11, numpy, pandas, scikit-learn, kloppy. The code was developed with the help of Claude Code
++(Anthropic), an AI coding assistant. In line with the competition terms, its analysis of the challenge
++match used aggregate statistics (counts, rates, scores) computed locally, and project permission rules
++block it from reading the challenge data files.

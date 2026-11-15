@@ -48,6 +48,10 @@ class DegradeConfig:
     # The real ball barely wobbles (|acceleration| p50 0.01 m/frame^2), so its error must curve
     # gently: averaged twice over this window, not once.
     ball_noise_smoothing_frames: int = 50
+    # The challenge tracker smooths the ball heavily: its 0.2 s velocity changes have p90 3.6 m/s and
+    # p99 7.4 m/s, vs 6-7 and 18-21 m/s on the clean sample balls. A centred average over this many
+    # frames, before the noise is added, reproduces that (p90 ~3.4, p99 ~7).
+    ball_position_smoothing_frames: int = 21
     # Sources whose ball is tracked on every frame (DFL/TRACAB) lose it the way an optical
     # tracker does, measured on the Metrica games: whole dead stretches lose it 96.8% of the time;
     # in live play ~1.27 gaps per minute cover 8.8% of frames — half are a few frames (brief
@@ -109,6 +113,9 @@ def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: Degrad
     players_norm[:, :, 2] = _speed_from_positions_mps(players_norm, clean_tracking,
                                                       degrade_config.speed_window_frames)
     ball_norm = clean_tracking.ball_norm.astype(np.float64).copy()
+    for axis in (0, 1):
+        ball_norm[:, axis] = _centred_mean_where_tracked(
+            ball_norm[:, axis], degrade_config.ball_position_smoothing_frames)
     pitch_size_m = np.array([clean_tracking.pitch_length_m, clean_tracking.pitch_width_m])
     ball_error_m = (_twice_smoothed_unit_noise((len(ball_norm), 2),
                                                degrade_config.ball_noise_smoothing_frames,
@@ -144,6 +151,20 @@ def _twice_smoothed_unit_noise(shape: tuple[int, int], smoothing_frames: int,
     twice = (cumulative[smoothing_frames:] - cumulative[:-smoothing_frames]) / smoothing_frames
     twice = np.concatenate((twice, np.repeat(twice[-1:], smoothing_frames - 1, axis=0)))
     return twice / twice.std(axis=0)
+
+
+def _centred_mean_where_tracked(values: NDArray[np.float64],
+                                window_frames: int) -> NDArray[np.float64]:
+    """Untracked frames stay NaN; tracked frames average only the tracked frames around them."""
+    is_tracked = ~np.isnan(values)
+    cumulative_sum = np.concatenate(([0.0], np.cumsum(np.where(is_tracked, values, 0.0))))
+    cumulative_count = np.concatenate(([0], np.cumsum(is_tracked)))
+    frame_index = np.arange(len(values))
+    window_start = np.maximum(0, frame_index - window_frames // 2)
+    window_end = np.minimum(len(values), frame_index + window_frames // 2 + 1)
+    count = cumulative_count[window_end] - cumulative_count[window_start]
+    return np.where(is_tracked, (cumulative_sum[window_end] - cumulative_sum[window_start])
+                    / np.maximum(count, 1), np.nan)
 
 
 def _player_dropout_mask(n_frames: int, n_slots: int, degrade_config: DegradeConfig,

@@ -10,6 +10,12 @@ the same harness version (marked by the italic rows).
 
 | # | Change | Validation spellF1 | Result |
 |---|---|---|---|
+| 017 | Ball direction-change ("kink") features | 0.618 (vs 0.613) | ❌ rejected |
+| 014 | Realistic ball smoothing in the harness; submission retrained | **0.613** | ✅ kept |
+| — | *Harness: ball smoothed like the real tracker; 012 re-scored 0.613, baseline 0.309* | — | — |
+| 016 | Boundary-weighted training / shorter feature windows | 0.632 / 0.620 (vs 0.629) | ❌ rejected |
+| 015 | Learned switch model → evidence-dependent switch costs | 0.636 (vs 0.629) | ❌ rejected |
+| — | *Oracle decomposition: perfect dead ball 0.666, perfect team labels 0.930* | — | — |
 | 013 | Also train on 20 SkillCorner A-League matches | 0.595 (vs 0.629) | ❌ rejected |
 | 012 | Train on 7 extra Bundesliga matches (DFL open data) | **0.629** (vs 0.618) | ✅ kept |
 | — | *Harness: 10 matches (3 Metrica + 7 DFL); 009 re-scored 0.618, baseline 0.312* | — | — |
@@ -44,6 +50,62 @@ Full-match counts are sanity checks only. The public 5 minutes are for correctne
 never for choosing versions.
 
 ---
+
+## 017 — Ball direction-change ("kink") features  ❌ REJECTED
+
+**Idea (from a second-opinion review):** an interception shows as a sudden change in the ball's
+direction or speed near an opponent, even if the new team keeps the ball only briefly.
+
+**Change:** ball velocity over 0.2 s and 0.4 s before and after each frame; the size of the change,
+turn angle and speed change; credited to the team whose player is clearly nearest; recent maximum
+per team.
+
+**Result:** +0.010 and better in all 10 games on the old harness — but the real match's ball changes
+direction far more gently (90th percentile 3.6 m/s vs 6–7 m/s on the samples). With the sample ball
+smoothed to match (014), the gain shrank to **+0.004 (8/10 games)**. The tracker smooths away most of
+the signal. Script: `experiments/scripts/ball_kink_features.py`.
+
+## 014 — Realistic ball smoothing in the harness  ✅ KEPT
+
+**Problem:** found while testing 017 — the challenge tracker smooths the ball heavily, the clean
+sample balls do not, so training and validation saw sharper ball movement than the real match.
+
+**Change:** degradation averages the ball position over 21 frames (0.84 s) before adding noise,
+matched to the real match's ball velocity changes. Realism improves elsewhere too (ball within 1 m of a
+player 28.4% vs 28.5% real; touch evidence 39% vs 37.5%). The submission is retrained on this data.
+
+**Result:** a stricter yardstick: 012's pipeline scores **0.613** (baseline 0.309). The retrained
+submission differs from 012's on 0.9% of frames (264 vs 268 possessions). Kept on principle: the model
+should learn from data that looks like what it labels.
+
+## 016 — Boundary-weighted training / shorter windows  ❌ REJECTED
+
+**Switch-error breakdown of 012 first** (6,042 true open-play turnovers): nearest predicted switch
+within 0.5 s 15%, 0.5–1 s 13%, 1–2 s 14%, 2–5 s 11%, **none within 5 s 46%**. False switches: 13% of
+predicted switches. Wrong-team stretches of 5 s or more: 2% of live frames. So the main error is
+**missed short possessions** (won and lost within seconds), not long wrong-team spells.
+
+**Changes and results:** 3× weight on frames within ±1 s of a true switch: 0.632 (6/10 games, noise);
+dropping the ±2.5 s window: 0.620 (1/10, worse — the long window steadies the model); both: 0.621.
+Script: `experiments/scripts/boundary_weighting_and_windows.py`.
+
+## 015 — Learned switch model → evidence-dependent switch costs  ❌ REJECTED
+
+**Idea (review):** a fixed switch cost erases short possessions; make it cheap where a switch is likely.
+
+**Change:** a second classifier predicts "possession changes within ±0.5 s" from the features plus
+before/after evidence contrasts; the Viterbi cost drops where it is confident.
+
+**Result:** best 0.636 vs 0.629, best of 9 settings — within noise. It moves the decoder's cost but
+cannot fix frames where the possession model itself is wrong. Script:
+`experiments/scripts/learned_switch_costs.py`.
+
+## Oracle decomposition  (diagnostic)
+
+Swapping in the truth one part at a time on the 10 validation matches: perfect dead ball → 0.666
+(+0.037); perfect team labels with our dead ball → **0.930 (+0.301)**. The headroom is in
+team switching, not dead ball (only 4.3% of frames called dead while live, 0.3% the reverse). Script:
+`experiments/scripts/oracle_decomposition.py`.
 
 ## 013 — Also train on 20 SkillCorner A-League matches  ❌ REJECTED
 
