@@ -1,9 +1,9 @@
-# Our submission — possession labelling pipeline
+# Beyond XI: possession labelling pipeline
 
 A learned possession model with Viterbi decoding, trained only on public matches from other
 competitions, plus rule-based dead-ball detection. The approach, every experiment (kept and
 rejected) and the numbers behind each decision are in [ITERATIONS.md](ITERATIONS.md); the
-technical document is `<team_name>.pdf`.
+technical document is [Beyond_XI.md](Beyond_XI.md).
 
 ## Reproduce the submission
 
@@ -18,7 +18,7 @@ uv pip install --python .venv -r requirements-mtah.txt
 bash scripts/download_public_data.sh
 
 # 3. Regenerate the submission (deterministic: same inputs, same bytes)
-.venv/bin/python run.py --output <team_name>.csv
+.venv/bin/python run.py --output Beyond_XI.csv
 ```
 
 `run.py` trains the model on the public matches, labels the challenge match, writes the CSV and
@@ -44,10 +44,14 @@ later runs take under a minute.
 
 ## Data credits
 
-- Metrica Sports sample data — https://github.com/metrica-sports/sample-data
-- IDSSE / DFL open data, CC-BY 4.0, data owner Deutsche Fußball Liga (DFL). Bassek, M., Weber,
-  H., Rein, R. & Memmert, D. (2025). An integrated dataset of spatiotemporal and event data in
-  elite soccer. *Scientific Data*. https://doi.org/10.1038/s41597-025-04505-y
+- IDSSE / DFL open data: data owner Deutsche Fußball Liga (DFL), collected by Sportec Solutions,
+  CC-BY 4.0. Bassek, M., Weber, H., Rein, R. & Memmert, D. (2025). An integrated dataset of
+  spatiotemporal and event data in elite soccer. *Scientific Data*, 12, 195.
+  https://doi.org/10.1038/s41597-025-04505-y
+- Metrica Sports sample data, https://github.com/metrica-sports/sample-data. Courtesy of Metrica
+  Sports.
+- SkillCorner open data, https://github.com/SkillCorner/opendata (MIT licence). Courtesy of
+  SkillCorner; tested during development, not used in the submitted model.
 
 No challenge match data is committed: `data/` is gitignored, and no labels of the challenge match
 are used for training or tuning.
