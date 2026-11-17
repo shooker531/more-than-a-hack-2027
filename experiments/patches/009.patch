@@ -1,0 +1,545 @@
+diff --git a/mtah/config.py b/mtah/config.py
+index 99a20d0..3a11386 100644
+--- a/mtah/config.py
++++ b/mtah/config.py
+@@ -81,6 +81,25 @@ class PipelineConfig:
+     # own proxy for control. One touch alone (a deflection, a duel) never switches possession.
+     possession_switch_consecutive_touches: int = 2
+ 
++    # --- learned possession model + Viterbi decoder (possession_model.py, decode_viterbi.py) --
++    # Gradient-boosted trees predicting P(home has the ball) per live frame, trained on the
++    # sample games only. Settings are conventional, not tuned: moderate depth and learning rate
++    # with L2, because three training games make overfitting the main risk.
++    model_max_iterations: int = 300
++    model_learning_rate: float = 0.05
++    model_max_leaf_nodes: int = 31
++    model_l2_regularisation: float = 1.0
++    model_random_seed: int = 0
++    # Consecutive frames are near-duplicates; every 5th frame keeps the information at a fifth
++    # of the training cost.
++    model_training_frame_step: int = 5
++    # Viterbi over H/A inside live play: the log-probability evidence for the other team must
++    # outweigh this cost before possession switches. Leave-one-game-out: 5 -> 0.620,
++    # 10 -> 0.635, 20 -> 0.642, 40 -> 0.643; 20 is where gains flatten.
++    model_switch_cost: float = 20.0
++    # Probabilities are clipped so one overconfident frame cannot force a switch by itself.
++    model_probability_floor: float = 1e-3
++
+ 
+ 
+ DEFAULT_CONFIG = PipelineConfig()
+diff --git a/mtah/features.py b/mtah/features.py
+index eef9e86..8a98d28 100644
+--- a/mtah/features.py
++++ b/mtah/features.py
+@@ -1,6 +1,6 @@
+ """Per-frame features from the tracking arrays, vectorised over all frames.
+ 
+-Entry point: compute_frame_features.
++Entry points: compute_frame_features, centred_nan_mean (also used by model_features).
+ 
+ All distances are computed in metres: the pitch is not square, so distances in normalised units
+ would stretch the short axis and pick the wrong nearest player near the touchlines.
+@@ -41,7 +41,7 @@ def compute_frame_features(tracking: domain.TrackingData,
+                                                           tracking.slot_team, domain.HOME_TEAM),
+         nearest_away_distance_m=_nearest_distance_of_team(player_to_ball_distance_m,
+                                                           tracking.slot_team, domain.AWAY_TEAM),
+-        median_player_speed_mps=_centred_nan_mean(
++        median_player_speed_mps=centred_nan_mean(
+             median_player_speed_mps, pipeline_config.player_speed_smoothing_frames),
+     )
+ 
+@@ -75,7 +75,7 @@ def _nearest_distance_of_team(player_to_ball_distance_m: NDArray[np.float64],
+         return np.nanmin(team_distances_m, axis=1)
+ 
+ 
+-def _centred_nan_mean(values: domain.FloatPerFrame, window_frames: int) -> domain.FloatPerFrame:
++def centred_nan_mean(values: domain.FloatPerFrame, window_frames: int) -> domain.FloatPerFrame:
+     """Cumulative sums keep the cost independent of the window size."""
+     is_valid = ~np.isnan(values)
+     cumulative_sum = np.concatenate(([0.0], np.cumsum(np.where(is_valid, values, 0.0))))
+diff --git a/mtah/pipeline.py b/mtah/pipeline.py
+index c57be57..a87b377 100644
+--- a/mtah/pipeline.py
++++ b/mtah/pipeline.py
+@@ -1,24 +1,43 @@
+ """The processing steps from tracking + tagging to labels, in order. No I/O.
+ 
+-Entry point: label_possessions.
++Entry points: compute_model_inputs, label_possessions.
+ 
+ Shared by run.py (the submission) and run_validation.py (the external validation games), so the
+-validated pipeline and the submitted pipeline cannot drift apart.
++validated pipeline and the submitted pipeline cannot drift apart. The possession model is passed
++in already trained: run.py trains it on all sample games, run_validation.py on all but the game
++being scored.
+ """
+ 
+ from __future__ import annotations
+ 
++import numpy as np
+ import pandas as pd
++from numpy.typing import NDArray
++from sklearn.ensemble import HistGradientBoostingClassifier
+ 
+-from . import config, dead_ball, decode_rules, domain, evidence, features
++from . import (config, dead_ball, decode_viterbi, domain, evidence, features, model_features,
++               possession_model)
++
++
++def compute_model_inputs(tracking: domain.TrackingData, frame_features: domain.FrameFeatures,
++                         graded_halves: list[domain.GradedHalf],
++                         pipeline_config: config.PipelineConfig) -> NDArray[np.float32]:
++    """The model's feature matrix for one match. Also used to build training examples, so
++    training and prediction see features computed the same way."""
++    return model_features.compute_model_features(
++        tracking, frame_features,
++        evidence.detect_control_evidence(frame_features, pipeline_config),
++        evidence.detect_touch_evidence(frame_features, pipeline_config), graded_halves)
+ 
+ 
+ def label_possessions(tracking: domain.TrackingData, tagging: pd.DataFrame,
+                       graded_halves: list[domain.GradedHalf],
+-                      pipeline_config: config.PipelineConfig) -> domain.LabelPerFrame:
++                      pipeline_config: config.PipelineConfig,
++                      trained_model: HistGradientBoostingClassifier) -> domain.LabelPerFrame:
+     frame_features = features.compute_frame_features(tracking, pipeline_config)
+     is_dead = dead_ball.detect_dead_ball(frame_features, tagging, graded_halves, pipeline_config)
+-    control_evidence = evidence.detect_control_evidence(frame_features, pipeline_config)
+-    touch_evidence = evidence.detect_touch_evidence(frame_features, pipeline_config)
+-    return decode_rules.decode_possession_labels(control_evidence, touch_evidence, is_dead,
+-                                                 tagging, graded_halves, pipeline_config)
++    home_probability = possession_model.predict_home_probability(
++        trained_model, compute_model_inputs(tracking, frame_features, graded_halves,
++                                            pipeline_config))
++    return decode_viterbi.decode_possession_labels(home_probability, is_dead, graded_halves,
++                                                   pipeline_config)
+diff --git a/run.py b/run.py
+index 1574441..41c08e1 100644
+--- a/run.py
++++ b/run.py
+@@ -3,8 +3,11 @@
+     .venv/bin/python run.py                              # evaluation/results/mtah_mvp.csv
+     .venv/bin/python run.py --output path/to/team.csv
+ 
+-main() reads top to bottom: load inputs -> label (mtah/pipeline.py lists the processing steps)
+--> write -> validate -> report.
++main() reads top to bottom: load the match -> train the possession model on the public sample
++games -> label (mtah/pipeline.py lists the processing steps) -> write -> validate -> report.
++
++Prerequisite (once): git clone https://github.com/metrica-sports/sample-data
++data/external/metrica-sample-data
+ """
+ 
+ from __future__ import annotations
+@@ -14,11 +17,14 @@ import os
+ import sys
+ 
+ import games
+-from mtah import config, load, pipeline, write
++from mtah import config, load, pipeline, possession_model, write
++from validation import sample_games, training_data
+ 
+ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+ _DEFAULT_OUTPUT_PATH = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
+ _CACHE_DIR = os.path.join(games.DATA_DIR, "cache")
++_SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
++_SAMPLE_CACHE_DIR = os.path.join(games.DATA_DIR, "cache", "validation")
+ 
+ 
+ def main(output_path: str, pipeline_config: config.PipelineConfig) -> None:
+@@ -26,7 +32,16 @@ def main(output_path: str, pipeline_config: config.PipelineConfig) -> None:
+     tagging = load.load_tagging(games.GAME, games.DATA_DIR)
+     graded_halves = load.load_graded_halves(games.GAME)
+ 
+-    labels = pipeline.label_possessions(tracking, tagging, graded_halves, pipeline_config)
++    training_examples = training_data.combine_training_examples([
++        training_data.build_training_examples(
++            sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR, _SAMPLE_CACHE_DIR),
++            pipeline_config)
++        for game_number in sample_games.SAMPLE_GAME_NUMBERS])
++    trained_model = possession_model.train_possession_model(
++        training_examples.feature_rows, training_examples.is_home_in_possession, pipeline_config)
++
++    labels = pipeline.label_possessions(tracking, tagging, graded_halves, pipeline_config,
++                                        trained_model)
+ 
+     write.write_submission_csv(output_path, labels)
+     is_valid, validator_report = write.run_official_validator(output_path)
+diff --git a/run_validation.py b/run_validation.py
+index a4a53bd..f98db7f 100644
+--- a/run_validation.py
++++ b/run_validation.py
+@@ -5,11 +5,13 @@
+ This is the number that decides whether an iteration is kept (ITERATIONS.md). It runs the exact
+ labelling code the submission uses (mtah.pipeline.label_possessions) on three other matches whose
+ tracking has been degraded to look like the challenge's, against possession labels derived from
+-their human-annotated events. Results also go to evaluation/reports/validation_latest.json, which
++their human-annotated events. Leave-one-game-out: each game is scored with a possession model
++trained only on the other two, so no game is ever scored by a model that saw it. Results also go to evaluation/reports/validation_latest.json, which
+ scripts/log_experiment.py records.
+ 
+-main() reads top to bottom: for each game, load -> derive truth -> for each seed: degrade ->
+-synthesise tags -> label (pipeline and baseline) -> then score everything and report.
++main() reads top to bottom: load every game and build its training examples -> for each game:
++train on the others -> derive truth -> for each seed: degrade -> synthesise tags -> label
++(pipeline and baseline) -> then score everything and report.
+ 
+ Prerequisite (once): git clone https://github.com/metrica-sports/sample-data
+ data/external/metrica-sample-data
+@@ -23,9 +25,9 @@ import os
+ import numpy as np
+ 
+ import games
+-from mtah import config, pipeline
++from mtah import config, pipeline, possession_model
+ from validation import (degrade, event_labels, reference_baseline, sample_games, scoring,
+-                        synthetic_tagging)
++                        synthetic_tagging, training_data)
+ 
+ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+ _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
+@@ -38,9 +40,21 @@ _BOOTSTRAP_DRAWS = 1000
+ 
+ 
+ def main(pipeline_config: config.PipelineConfig) -> None:
++    loaded_games = {game_number: sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR,
++                                                               _CACHE_DIR)
++                    for game_number in sample_games.SAMPLE_GAME_NUMBERS}
++    examples_by_game = {game_number: training_data.build_training_examples(sample_game,
++                                                                           pipeline_config)
++                        for game_number, sample_game in loaded_games.items()}
++
+     truth_runs, pipeline_runs, baseline_runs, run_names = [], [], [], []
+-    for game_number in sample_games.SAMPLE_GAME_NUMBERS:
+-        sample_game = sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR, _CACHE_DIR)
++    for game_number, sample_game in loaded_games.items():
++        held_out_training = training_data.combine_training_examples(
++            [examples for other_game, examples in examples_by_game.items()
++             if other_game != game_number])
++        trained_model = possession_model.train_possession_model(
++            held_out_training.feature_rows, held_out_training.is_home_in_possession,
++            pipeline_config)
+         truth = event_labels.derive_possession_labels(
+             sample_game.events, sample_game.graded_halves, len(sample_game.tracking.ball_norm))
+         for seed in _DEGRADATION_SEEDS:
+@@ -49,7 +63,8 @@ def main(pipeline_config: config.PipelineConfig) -> None:
+             tagging = synthetic_tagging.synthesize_set_piece_tags(
+                 sample_game.events, sample_game.graded_halves, seed)
+             pipeline_runs.append(pipeline.label_possessions(
+-                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config))
++                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config,
++                trained_model))
+             baseline_runs.append(reference_baseline.label_with_official_baseline(degraded_tracking))
+             truth_runs.append(truth)
+             run_names.append("game{}/seed{}".format(game_number, seed))
+diff --git a/mtah/decode_viterbi.py b/mtah/decode_viterbi.py
+new file mode 100644
+index 0000000..da7bb3d
+--- /dev/null
++++ b/mtah/decode_viterbi.py
+@@ -0,0 +1,69 @@
++"""Viterbi decoder: the most likely H / A sequence inside each live stretch, given the model's
++per-frame probabilities.
++
++Entry point: decode_possession_labels.
++
++Dead ball comes from the rule-based detector (dead_ball.detect_dead_ball) and is kept as is.
++Inside each live stretch, each frame scores log P(home) for H and log P(away) for A, and every
++change of team pays model_switch_cost. Viterbi finds the labelling with the highest total.
++So possession switches only when the model is confidently on the other side for long enough:
++a few uncertain frames cannot flip it, a sustained shift does, and the switch lands where the
++evidence turns rather than after a fixed confirmation delay.
++
++An earlier version scored hand-set evidence weights (iteration 007) and lost to the rules; the
++difference is calibrated probabilities from a model that learned what each cue is worth.
++Ungraded frames are X.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from numpy.typing import NDArray
++
++from . import config, domain, runs
++
++_HOME_STATE, _AWAY_STATE = 0, 1
++
++
++def decode_possession_labels(home_probability: domain.FloatPerFrame,
++                             is_dead: domain.BoolPerFrame,
++                             graded_halves: list[domain.GradedHalf],
++                             pipeline_config: config.PipelineConfig) -> domain.LabelPerFrame:
++    floor = pipeline_config.model_probability_floor
++    clipped = np.clip(home_probability, floor, 1.0 - floor)
++    log_probabilities = np.column_stack((np.log(clipped), np.log(1.0 - clipped)))
++
++    labels = np.full(len(home_probability), domain.LABEL_ABSTAIN, dtype="<U1")
++    for graded_half in graded_halves:
++        half_start, half_end = graded_half.first_video_frame, graded_half.last_video_frame + 1
++        labels[half_start:half_end] = domain.LABEL_DEAD
++        for live_start, live_end in runs.true_runs(~is_dead[half_start:half_end]):
++            live = slice(half_start + live_start, half_start + live_end)
++            states = _most_likely_team_sequence(log_probabilities[live],
++                                                pipeline_config.model_switch_cost)
++            labels[live] = np.where(states == _HOME_STATE, domain.LABEL_HOME, domain.LABEL_AWAY)
++    return labels
++
++
++def _most_likely_team_sequence(log_probabilities: NDArray[np.float64],
++                               switch_cost: float) -> NDArray[np.int8]:
++    """Two-state Viterbi. The loop runs over frames (~80k per half in total); each step is a
++    handful of scalar operations, so a half decodes in well under a second."""
++    n_frames = len(log_probabilities)
++    came_from_other = np.zeros((n_frames, 2), dtype=bool)
++    best_home, best_away = float(log_probabilities[0, 0]), float(log_probabilities[0, 1])
++    home_scores, away_scores = log_probabilities[:, 0].tolist(), log_probabilities[:, 1].tolist()
++    for frame in range(1, n_frames):
++        home_from_away = best_away - switch_cost
++        away_from_home = best_home - switch_cost
++        came_from_other[frame, 0] = home_from_away > best_home
++        came_from_other[frame, 1] = away_from_home > best_away
++        best_home, best_away = (max(best_home, home_from_away) + home_scores[frame],
++                                max(best_away, away_from_home) + away_scores[frame])
++
++    states = np.zeros(n_frames, dtype=np.int8)
++    states[-1] = _HOME_STATE if best_home >= best_away else _AWAY_STATE
++    for frame in range(n_frames - 1, 0, -1):
++        current = states[frame]
++        states[frame - 1] = 1 - current if came_from_other[frame, current] else current
++    return states
+diff --git a/mtah/model_features.py b/mtah/model_features.py
+new file mode 100644
+index 0000000..190ab27
+--- /dev/null
++++ b/mtah/model_features.py
+@@ -0,0 +1,131 @@
++"""Per-frame features for the learned possession model: ball evidence plus team structure and
++movement.
++
++Entry points: FEATURE_NAMES, compute_model_features.
++
++Every feature is home-minus-away (or signed so that positive favours home), so one model serves
++both teams and cannot learn "home usually has the ball" from these three sample games. Team
++positions are expressed in each team's attacking direction, inferred per half from where each
++team's players stand on average (a team defends the half it mostly occupies) — no labels needed.
++
++Missing values stay NaN; the gradient-boosted model handles them natively.
++"""
++
++from __future__ import annotations
++
++import warnings
++
++import numpy as np
++from numpy.typing import NDArray
++
++from . import config, domain, features
++
++# Centred averaging windows: immediate actions, a passage of play, team structure.
++_CONTEXT_WINDOWS_FRAMES = (13, 51, 125)
++_PRESSING_RADIUS_M = 5.0
++_CENTROID_VELOCITY_SPAN_FRAMES = 25
++
++_INSTANT_FEATURES = (
++    "nearest_home_m", "nearest_away_m", "nearest_difference_m", "ball_speed_mps",
++    "is_ball_tracked", "control_evidence", "touch_evidence",
++    "advance_difference_m", "forward_velocity_difference_mps", "width_difference_m",
++    "length_difference_m", "speed_difference_mps", "pressing_difference",
++)
++_SMOOTHED_FEATURES = ("nearest_difference_m", "control_evidence", "touch_evidence",
++                      "advance_difference_m", "forward_velocity_difference_mps",
++                      "width_difference_m", "pressing_difference")
++FEATURE_NAMES = (list(_INSTANT_FEATURES)
++                 + ["{}_mean_{}f".format(name, window) for window in _CONTEXT_WINDOWS_FRAMES
++                    for name in _SMOOTHED_FEATURES])
++
++
++def compute_model_features(tracking: domain.TrackingData, frame_features: domain.FrameFeatures,
++                           control_evidence: domain.TeamCodePerFrame,
++                           touch_evidence: domain.TeamCodePerFrame,
++                           graded_halves: list[domain.GradedHalf]) -> NDArray[np.float32]:
++    """(n_frames, len(FEATURE_NAMES)) float32, NaN where a feature is undefined."""
++    players_x_m = tracking.players_norm[:, :, 0].astype(np.float64) * tracking.pitch_length_m
++    players_y_m = tracking.players_norm[:, :, 1].astype(np.float64) * tracking.pitch_width_m
++    players_speed = tracking.players_norm[:, :, 2].astype(np.float64)
++    is_home = tracking.slot_team == domain.HOME_TEAM
++    attack_sign = _home_attack_sign_per_frame(players_x_m, is_home, graded_halves)
++
++    ball_x_m = tracking.ball_norm[:, 0].astype(np.float64) * tracking.pitch_length_m
++    ball_y_m = tracking.ball_norm[:, 1].astype(np.float64) * tracking.pitch_width_m
++    distance_to_ball_m = np.hypot(players_x_m - ball_x_m[:, None], players_y_m - ball_y_m[:, None])
++
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", RuntimeWarning)
++        per_team = {team: _team_shape(players_x_m[:, mask], players_y_m[:, mask],
++                                      players_speed[:, mask], distance_to_ball_m[:, mask],
++                                      sign, tracking.pitch_length_m)
++                    for team, mask, sign in ((domain.HOME_TEAM, is_home, attack_sign),
++                                             (domain.AWAY_TEAM, ~is_home, -attack_sign))}
++
++    home, away = per_team[domain.HOME_TEAM], per_team[domain.AWAY_TEAM]
++    instant = {
++        "nearest_home_m": frame_features.nearest_home_distance_m,
++        "nearest_away_m": frame_features.nearest_away_distance_m,
++        "nearest_difference_m": (frame_features.nearest_away_distance_m
++                                 - frame_features.nearest_home_distance_m),
++        "ball_speed_mps": frame_features.ball_speed_mps,
++        "is_ball_tracked": frame_features.is_ball_tracked.astype(np.float64),
++        "control_evidence": _signed_team_evidence(control_evidence),
++        "touch_evidence": _signed_team_evidence(touch_evidence),
++        "advance_difference_m": home["advance_m"] - away["advance_m"],
++        "forward_velocity_difference_mps": home["forward_velocity_mps"]
++        - away["forward_velocity_mps"],
++        "width_difference_m": home["width_m"] - away["width_m"],
++        "length_difference_m": home["length_m"] - away["length_m"],
++        "speed_difference_mps": home["mean_speed_mps"] - away["mean_speed_mps"],
++        "pressing_difference": home["players_near_ball"] - away["players_near_ball"],
++    }
++    columns = [instant[name] for name in _INSTANT_FEATURES]
++    for window in _CONTEXT_WINDOWS_FRAMES:
++        columns += [features.centred_nan_mean(instant[name], window) for name in _SMOOTHED_FEATURES]
++    return np.column_stack(columns).astype(np.float32)
++
++
++def _home_attack_sign_per_frame(players_x_m: NDArray[np.float64], is_home: NDArray[np.bool_],
++                                graded_halves: list[domain.GradedHalf]) -> domain.FloatPerFrame:
++    """+1 where home attacks towards increasing x, -1 otherwise. A team spends most of a half in
++    its own defensive half, so the team with the lower average x defends the low-x goal."""
++    sign = np.ones(len(players_x_m))
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", RuntimeWarning)
++        for graded_half in graded_halves:
++            half = slice(graded_half.first_video_frame, graded_half.last_video_frame + 1)
++            home_mean_x = np.nanmean(players_x_m[half][:, is_home])
++            away_mean_x = np.nanmean(players_x_m[half][:, ~is_home])
++            sign[half] = 1.0 if home_mean_x < away_mean_x else -1.0
++    return sign
++
++
++
++def _team_shape(team_x_m: NDArray[np.float64], team_y_m: NDArray[np.float64],
++                team_speed: NDArray[np.float64], team_distance_to_ball_m: NDArray[np.float64],
++                attack_sign: NDArray[np.float64], pitch_length_m: float
++                ) -> dict[str, domain.FloatPerFrame]:
++    """advance_m: team centroid's distance from its own goal line. The team in possession pushes
++    up, spreads wide and long, and moves forward; the defending team drops and compacts."""
++    attacking_x_m = np.where(attack_sign[:, None] > 0, team_x_m, pitch_length_m - team_x_m)
++    advance_m = np.nanmean(attacking_x_m, axis=1)
++    span = _CENTROID_VELOCITY_SPAN_FRAMES
++    forward_velocity = np.full(len(advance_m), np.nan)
++    forward_velocity[span:] = ((advance_m[span:] - advance_m[:-span])
++                               * config.FRAMES_PER_SECOND / span)
++    return {
++        "advance_m": advance_m,
++        "forward_velocity_mps": forward_velocity,
++        "width_m": np.nanstd(team_y_m, axis=1),
++        "length_m": np.nanstd(attacking_x_m, axis=1),
++        "mean_speed_mps": np.nanmean(team_speed, axis=1),
++        "players_near_ball": np.sum(team_distance_to_ball_m <= _PRESSING_RADIUS_M,
++                                    axis=1).astype(np.float64),
++    }
++
++
++def _signed_team_evidence(evidence: domain.TeamCodePerFrame) -> domain.FloatPerFrame:
++    return np.where(evidence == domain.HOME_TEAM, 1.0,
++                    np.where(evidence == domain.AWAY_TEAM, -1.0, 0.0))
++
+diff --git a/mtah/possession_model.py b/mtah/possession_model.py
+new file mode 100644
+index 0000000..a76dbbb
+--- /dev/null
++++ b/mtah/possession_model.py
+@@ -0,0 +1,36 @@
++"""The learned per-frame possession model: P(home has the ball) from model_features.
++
++Entry points: train_possession_model, predict_home_probability.
++
++Trained only on other matches (the Metrica sample games, labels from their human-annotated
++events), never on the challenge match — RULES.md forbids labels on the provided game. Training
++is deterministic (fixed seed, single model), so run.py regenerates the same submission.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++from numpy.typing import NDArray
++from sklearn.ensemble import HistGradientBoostingClassifier
++
++from . import config, domain
++
++
++def train_possession_model(feature_rows: NDArray[np.float32],
++                           is_home_in_possession: NDArray[np.bool_],
++                           pipeline_config: config.PipelineConfig
++                           ) -> HistGradientBoostingClassifier:
++    model = HistGradientBoostingClassifier(
++        max_iter=pipeline_config.model_max_iterations,
++        learning_rate=pipeline_config.model_learning_rate,
++        max_leaf_nodes=pipeline_config.model_max_leaf_nodes,
++        l2_regularization=pipeline_config.model_l2_regularisation,
++        random_state=pipeline_config.model_random_seed)
++    model.fit(feature_rows, is_home_in_possession.astype(np.int8))
++    return model
++
++
++def predict_home_probability(model: HistGradientBoostingClassifier,
++                             model_feature_matrix: NDArray[np.float32]) -> domain.FloatPerFrame:
++    probabilities: domain.FloatPerFrame = model.predict_proba(model_feature_matrix)[:, 1]
++    return probabilities
+diff --git a/validation/training_data.py b/validation/training_data.py
+new file mode 100644
+index 0000000..fe0a5ed
+--- /dev/null
++++ b/validation/training_data.py
+@@ -0,0 +1,50 @@
++"""Training examples for the possession model, built from the Metrica sample games.
++
++Entry points: TRAINING_DEGRADATION_SEED, TrainingExamples, build_training_examples,
++combine_training_examples.
++
++The tracking is degraded exactly as in validation, so the model learns from the same imperfect
++signals it will see on the challenge's automatic tracking. Labels are the event-derived
++controlled-possession truth, live frames only (dead ball is decided by the rule detector).
++"""
++
++from __future__ import annotations
++
++from typing import NamedTuple
++
++import numpy as np
++from numpy.typing import NDArray
++
++from mtah import config, domain, features, pipeline
++from validation import degrade, event_labels, sample_games
++
++# Training always uses one fixed degradation; validation scores seeds 0-2 of games the model did
++# not train on, so sharing seed 0 never leaks a scored game into training.
++TRAINING_DEGRADATION_SEED = 0
++
++
++class TrainingExamples(NamedTuple):
++    feature_rows: NDArray[np.float32]
++    is_home_in_possession: NDArray[np.bool_]
++
++
++def build_training_examples(sample_game: sample_games.SampleGame,
++                            pipeline_config: config.PipelineConfig) -> TrainingExamples:
++    truth = event_labels.derive_possession_labels(sample_game.events, sample_game.graded_halves,
++                                                  len(sample_game.tracking.ball_norm))
++    degraded_tracking = degrade.degrade_tracking(sample_game.tracking,
++                                                 degrade.DEFAULT_DEGRADE_CONFIG,
++                                                 TRAINING_DEGRADATION_SEED)
++    feature_matrix = pipeline.compute_model_inputs(
++        degraded_tracking, features.compute_frame_features(degraded_tracking, pipeline_config),
++        sample_game.graded_halves, pipeline_config)
++    is_live = (truth == domain.LABEL_HOME) | (truth == domain.LABEL_AWAY)
++    sampled_frames = np.flatnonzero(is_live)[::pipeline_config.model_training_frame_step]
++    return TrainingExamples(feature_matrix[sampled_frames],
++                            truth[sampled_frames] == domain.LABEL_HOME)
++
++
++def combine_training_examples(examples: list[TrainingExamples]) -> TrainingExamples:
++    return TrainingExamples(np.vstack([example.feature_rows for example in examples]),
++                            np.concatenate([example.is_home_in_possession
++                                            for example in examples]))

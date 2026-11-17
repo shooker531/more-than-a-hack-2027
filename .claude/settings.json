@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./data/tactical/**)",
+      "Read(./data/broadcast/**)",
+      "Read(./data/cache/BAR-ATH*)",
+      "Bash(cat *data/tactical*)",
+      "Bash(cat *data/broadcast*)",
+      "Bash(head *data/tactical*)",
+      "Bash(head *data/broadcast*)",
+      "Bash(tail *data/tactical*)",
+      "Bash(tail *data/broadcast*)",
+      "Bash(less *data/tactical*)",
+      "Bash(less *data/broadcast*)",
+      "Bash(grep *data/tactical*)",
+      "Bash(grep *data/broadcast*)",
+      "Bash(awk *data/tactical*)",
+      "Bash(awk *data/broadcast*)",
+      "Bash(sed *data/tactical*)",
+      "Bash(sed *data/broadcast*)",
+      "Bash(cut *data/tactical*)",
+      "Bash(cut *data/broadcast*)",
+      "Bash(strings *data/tactical*)",
+      "Bash(xxd *data/tactical*)"
+    ]
+  }
+}

@@ -1,3 +1,63 @@
+# Beyond XI: possession labelling pipeline
+
+A learned possession model with Viterbi decoding, trained only on public matches from other
+competitions, plus rule-based dead-ball detection. The approach, every experiment (kept and
+rejected) and the numbers behind each decision are in [ITERATIONS.md](ITERATIONS.md); the
+technical document is [Beyond_XI.md](Beyond_XI.md).
+
+## Reproduce the submission
+
+```bash
+# 1. Python environment (Python 3.11)
+uv venv --python 3.11 .venv
+uv pip install --python .venv -r requirements-mtah.txt
+
+# 2. Data
+#    a) the challenge bundle, unpacked into data/tactical/ (see data/README.md)
+#    b) the public training data (Metrica sample games + DFL open data, ~2.9 GB)
+bash scripts/download_public_data.sh
+
+# 3. Regenerate the submission (deterministic: same inputs, same bytes)
+.venv/bin/python run.py --output Beyond_XI.csv
+```
+
+`run.py` trains the model on the public matches, labels the challenge match, writes the CSV and
+runs the official validator. The first run parses and caches the public data (several minutes);
+later runs take under a minute.
+
+## Validate
+
+```bash
+.venv/bin/python run_validation.py               # leave-one-game-out on the 10 public matches
+.venv/bin/python scripts/compare_harness_realism.py   # simulated vs real tracking statistics
+```
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `run.py` | entry point: data → submission CSV |
+| `mtah/` | the pipeline: loading, features, dead-ball rules, model, Viterbi decoder |
+| `validation/` | public training/validation matches, their possession truth, tracking degradation |
+| `run_validation.py` | leave-one-game-out validation against the official scorer |
+| `ITERATIONS.md`, `experiments.csv` | experiment log; rejected experiments as `experiments/patches/` |
+
+## Data credits
+
+- IDSSE / DFL open data: data owner Deutsche Fußball Liga (DFL), collected by Sportec Solutions,
+  CC-BY 4.0. Bassek, M., Weber, H., Rein, R. & Memmert, D. (2025). An integrated dataset of
+  spatiotemporal and event data in elite soccer. *Scientific Data*, 12, 195.
+  https://doi.org/10.1038/s41597-025-04505-y
+- Metrica Sports sample data, https://github.com/metrica-sports/sample-data. Courtesy of Metrica
+  Sports.
+- SkillCorner open data, https://github.com/SkillCorner/opendata (MIT licence). Courtesy of
+  SkillCorner; tested during development, not used in the submitted model.
+
+No challenge match data is committed: `data/` is gitignored, and no labels of the challenge match
+are used for training or tuning.
+
+---
+
 # More than a Hack 2027 — Phase 1: Ball Possession
 
 **Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)

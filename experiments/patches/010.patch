@@ -1,0 +1,113 @@
+diff --git a/mtah/model_features.py b/mtah/model_features.py
+index 190ab27..880ce0d 100644
+--- a/mtah/model_features.py
++++ b/mtah/model_features.py
+@@ -17,6 +17,7 @@ import warnings
+ 
+ import numpy as np
+ from numpy.typing import NDArray
++from scipy.spatial import ConvexHull
+ 
+ from . import config, domain, features
+ 
+@@ -24,16 +25,24 @@ from . import config, domain, features
+ _CONTEXT_WINDOWS_FRAMES = (13, 51, 125)
+ _PRESSING_RADIUS_M = 5.0
+ _CENTROID_VELOCITY_SPAN_FRAMES = 25
++# The block's shape changes slowly, so the (relatively costly) convex hull is computed every 5th
++# frame and linearly interpolated in between.
++_HULL_FRAME_STEP = 5
++_PRESS_LINE_PLAYERS = 3
+ 
+ _INSTANT_FEATURES = (
+     "nearest_home_m", "nearest_away_m", "nearest_difference_m", "ball_speed_mps",
+     "is_ball_tracked", "control_evidence", "touch_evidence",
+     "advance_difference_m", "forward_velocity_difference_mps", "width_difference_m",
+     "length_difference_m", "speed_difference_mps", "pressing_difference",
++    "hull_area_difference_m2", "defensive_line_difference_m", "press_height_difference_m",
++    "opponent_half_share_difference", "ball_advance_for_home_m",
+ )
+ _SMOOTHED_FEATURES = ("nearest_difference_m", "control_evidence", "touch_evidence",
+                       "advance_difference_m", "forward_velocity_difference_mps",
+-                      "width_difference_m", "pressing_difference")
++                      "width_difference_m", "pressing_difference", "hull_area_difference_m2",
++                      "defensive_line_difference_m", "press_height_difference_m",
++                      "opponent_half_share_difference", "ball_advance_for_home_m")
+ FEATURE_NAMES = (list(_INSTANT_FEATURES)
+                  + ["{}_mean_{}f".format(name, window) for window in _CONTEXT_WINDOWS_FRAMES
+                     for name in _SMOOTHED_FEATURES])
+@@ -79,6 +88,16 @@ def compute_model_features(tracking: domain.TrackingData, frame_features: domain
+         "length_difference_m": home["length_m"] - away["length_m"],
+         "speed_difference_mps": home["mean_speed_mps"] - away["mean_speed_mps"],
+         "pressing_difference": home["players_near_ball"] - away["players_near_ball"],
++        "hull_area_difference_m2": home["hull_area_m2"] - away["hull_area_m2"],
++        "defensive_line_difference_m": home["defensive_line_m"] - away["defensive_line_m"],
++        "press_height_difference_m": home["press_height_m"] - away["press_height_m"],
++        "opponent_half_share_difference": home["opponent_half_share"]
++        - away["opponent_half_share"],
++        # Ball position along the pitch, measured from home's goal towards away's, centred on
++        # halfway: where play is relative to each team.
++        "ball_advance_for_home_m": np.where(attack_sign > 0, ball_x_m,
++                                            tracking.pitch_length_m - ball_x_m)
++        - tracking.pitch_length_m / 2,
+     }
+     columns = [instant[name] for name in _INSTANT_FEATURES]
+     for window in _CONTEXT_WINDOWS_FRAMES:
+@@ -106,9 +125,19 @@ def _team_shape(team_x_m: NDArray[np.float64], team_y_m: NDArray[np.float64],
+                 team_speed: NDArray[np.float64], team_distance_to_ball_m: NDArray[np.float64],
+                 attack_sign: NDArray[np.float64], pitch_length_m: float
+                 ) -> dict[str, domain.FloatPerFrame]:
+-    """advance_m: team centroid's distance from its own goal line. The team in possession pushes
+-    up, spreads wide and long, and moves forward; the defending team drops and compacts."""
++    """All distances are measured from the team's own goal line along its attacking direction.
++    The team in possession pushes up, spreads wide and long, holds a higher defensive line and
++    moves forward; the defending team drops, compacts and sits behind the ball.
++
++    defensive_line_m: the second-deepest player — the deepest is almost always the goalkeeper.
++    press_height_m: the mean of the three most advanced players.
++    hull_area_m2: convex hull of the outfield players (goalkeeper excluded), i.e. the block's
++    compactness."""
+     attacking_x_m = np.where(attack_sign[:, None] > 0, team_x_m, pitch_length_m - team_x_m)
++    deepest_first_m = np.sort(attacking_x_m, axis=1)  # NaN (untracked) sort to the end
++    most_advanced_first_m = -np.sort(-np.nan_to_num(attacking_x_m, nan=-np.inf), axis=1)
++    press_line_m = most_advanced_first_m[:, :_PRESS_LINE_PLAYERS]
++    tracked_count = np.sum(~np.isnan(attacking_x_m), axis=1)
+     advance_m = np.nanmean(attacking_x_m, axis=1)
+     span = _CENTROID_VELOCITY_SPAN_FRAMES
+     forward_velocity = np.full(len(advance_m), np.nan)
+@@ -122,9 +151,35 @@ def _team_shape(team_x_m: NDArray[np.float64], team_y_m: NDArray[np.float64],
+         "mean_speed_mps": np.nanmean(team_speed, axis=1),
+         "players_near_ball": np.sum(team_distance_to_ball_m <= _PRESSING_RADIUS_M,
+                                     axis=1).astype(np.float64),
++        "defensive_line_m": np.where(tracked_count >= 2, deepest_first_m[:, 1], np.nan),
++        "press_height_m": np.where(tracked_count >= _PRESS_LINE_PLAYERS,
++                                   np.mean(np.where(np.isfinite(press_line_m), press_line_m,
++                                                    np.nan), axis=1), np.nan),
++        "opponent_half_share": np.where(tracked_count > 0,
++                                        np.sum(attacking_x_m > pitch_length_m / 2, axis=1)
++                                        / np.maximum(tracked_count, 1), np.nan),
++        "hull_area_m2": _outfield_hull_area_m2(attacking_x_m, team_y_m),
+     }
+ 
+ 
++def _outfield_hull_area_m2(attacking_x_m: NDArray[np.float64],
++                           team_y_m: NDArray[np.float64]) -> domain.FloatPerFrame:
++    """Hull of the outfield players: the deepest player (the goalkeeper) is dropped, since a
++    goalkeeper 40 m behind the block would make every team look stretched. Needs at least three
++    outfield players; frames without are NaN and get interpolated over."""
++    n_frames = len(attacking_x_m)
++    sampled_frames = np.arange(0, n_frames, _HULL_FRAME_STEP)
++    sampled_area = np.full(len(sampled_frames), np.nan)
++    for index, frame in enumerate(sampled_frames):
++        is_tracked = ~np.isnan(attacking_x_m[frame])
++        points = np.column_stack((attacking_x_m[frame][is_tracked], team_y_m[frame][is_tracked]))
++        outfield = points[np.argsort(points[:, 0])[1:]]
++        sampled_area[index] = (ConvexHull(outfield, qhull_options="QJ").volume
++                               if len(outfield) >= 3 else np.nan)
++    is_valid = ~np.isnan(sampled_area)
++    return np.interp(np.arange(n_frames), sampled_frames[is_valid], sampled_area[is_valid])
++
++
+ def _signed_team_evidence(evidence: domain.TeamCodePerFrame) -> domain.FloatPerFrame:
+     return np.where(evidence == domain.HOME_TEAM, 1.0,
+                     np.where(evidence == domain.AWAY_TEAM, -1.0, 0.0))

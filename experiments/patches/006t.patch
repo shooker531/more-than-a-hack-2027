@@ -1,0 +1,190 @@
+diff --git a/mtah/config.py b/mtah/config.py
+index 8bdb7f3..c1b74c1 100644
+--- a/mtah/config.py
++++ b/mtah/config.py
+@@ -62,6 +62,11 @@ class PipelineConfig:
+     # tracking error. Tighter than control_radius_m because fast balls pass near players
+     # without being touched.
+     touch_radius_m: float = 1.0
++    # A team only gets evidence when its nearest player is this much nearer the ball than any
++    # opponent. On the sample games 42% of invented possessions handed the ball to the wrong
++    # team: in duels and under tight marking the defender is often the nearest player.
++    control_contest_margin_m: float = 0.5
++    touch_contest_margin_m: float = 0.5
+ 
+     # --- possession switching (the "controlled possession" rule) ---------------------------
+     # Evidence frames of one team separated by holes up to this long form one control episode.
+diff --git a/mtah/evidence.py b/mtah/evidence.py
+index ac3d9a4..50dd5ed 100644
+--- a/mtah/evidence.py
++++ b/mtah/evidence.py
+@@ -1,34 +1,29 @@
+-"""Per-frame control evidence: which team, if any, visibly controls the ball on this frame.
++"""Per-frame evidence of which team, if any, is on the ball.
+ 
+ Entry points: detect_control_evidence, detect_touch_evidence.
+ 
+-Evidence is deliberately sparse: only a slow, tracked ball with a player close to it counts.
+-Passes in flight, untracked balls and loose balls give NO_TEAM, and the decoder holds the
+-previous team through them (loose balls stay with the last team in control, per CHALLENGE.md).
++Evidence is deliberately sparse. Untracked balls, loose balls and contested balls give NO_TEAM,
++and the decoder holds the previous team through them (CHALLENGE.md: a contested or loose ball
++stays with the last team in possession).
+ """
+ 
+ from __future__ import annotations
+ 
+ import numpy as np
++from numpy.typing import NDArray
+ 
+ from . import config, domain
+ 
+ 
+ def detect_control_evidence(frame_features: domain.FrameFeatures,
+                             pipeline_config: config.PipelineConfig) -> domain.TeamCodePerFrame:
+-    # Untracked teams become +inf so they can never be the nearer team.
+-    nearest_home_m = np.nan_to_num(frame_features.nearest_home_distance_m, nan=np.inf)
+-    nearest_away_m = np.nan_to_num(frame_features.nearest_away_distance_m, nan=np.inf)
++    """A slow ball (not a pass in flight) with a player close to it."""
+     is_ball_in_flight = (frame_features.ball_speed_mps
+                          > pipeline_config.control_max_ball_speed_mps)
+-    is_controlled = (frame_features.is_ball_tracked & ~is_ball_in_flight
+-                     & (np.minimum(nearest_home_m, nearest_away_m)
+-                        <= pipeline_config.control_radius_m))
+-
+-    control_evidence = np.full(len(nearest_home_m), domain.NO_TEAM, dtype=np.int8)
+-    control_evidence[is_controlled & (nearest_home_m <= nearest_away_m)] = domain.HOME_TEAM
+-    control_evidence[is_controlled & (nearest_away_m < nearest_home_m)] = domain.AWAY_TEAM
+-    return control_evidence
++    return _team_clearly_on_the_ball(frame_features,
++                                     frame_features.is_ball_tracked & ~is_ball_in_flight,
++                                     pipeline_config.control_radius_m,
++                                     pipeline_config.control_contest_margin_m)
+ 
+ 
+ def detect_touch_evidence(frame_features: domain.FrameFeatures,
+@@ -38,13 +33,26 @@ def detect_touch_evidence(frame_features: domain.FrameFeatures,
+     showed no control evidence, the possessing team's nearest player was a median 0.4 m from the
+     ball while it moved at a median 11.9 m/s (interceptions, first-time passes). One touch is
+     not possession (a deflection, a 50/50); the decoder decides what a run of touches means."""
++    return _team_clearly_on_the_ball(frame_features, frame_features.is_ball_tracked,
++                                     pipeline_config.touch_radius_m,
++                                     pipeline_config.touch_contest_margin_m)
++
++
++def _team_clearly_on_the_ball(frame_features: domain.FrameFeatures,
++                              is_eligible: NDArray[np.bool_], radius_m: float,
++                              contest_margin_m: float) -> domain.TeamCodePerFrame:
++    """The team whose nearest player is within radius_m AND at least contest_margin_m nearer than
++    any opponent. In a duel or under tight marking both players are close, and the nearer one is
++    as often the defender as the ball carrier, so neither team gets evidence. Untracked teams are
++    +inf, so they are never the nearer team."""
+     nearest_home_m = np.nan_to_num(frame_features.nearest_home_distance_m, nan=np.inf)
+     nearest_away_m = np.nan_to_num(frame_features.nearest_away_distance_m, nan=np.inf)
+-    is_touching = (frame_features.is_ball_tracked
+-                   & (np.minimum(nearest_home_m, nearest_away_m)
+-                      <= pipeline_config.touch_radius_m))
+-
+-    touch_evidence = np.full(len(nearest_home_m), domain.NO_TEAM, dtype=np.int8)
+-    touch_evidence[is_touching & (nearest_home_m <= nearest_away_m)] = domain.HOME_TEAM
+-    touch_evidence[is_touching & (nearest_away_m < nearest_home_m)] = domain.AWAY_TEAM
+-    return touch_evidence
++    is_home_clear = (is_eligible & (nearest_home_m <= radius_m)
++                     & (nearest_home_m + contest_margin_m <= nearest_away_m))
++    is_away_clear = (is_eligible & (nearest_away_m <= radius_m)
++                     & (nearest_away_m + contest_margin_m <= nearest_home_m))
++
++    evidence = np.full(len(nearest_home_m), domain.NO_TEAM, dtype=np.int8)
++    evidence[is_home_clear] = domain.HOME_TEAM
++    evidence[is_away_clear] = domain.AWAY_TEAM
++    return evidence
+diff --git a/validation/event_labels.py b/validation/event_labels.py
+index 09235a7..8c061bb 100644
+--- a/validation/event_labels.py
++++ b/validation/event_labels.py
+@@ -5,10 +5,15 @@ Entry point: derive_possession_labels.
+ This approximates — it is not — the challenge's ground truth, which comes from corrected
+ tracking. Rules, chosen to match CHALLENGE.md's definition as closely as events allow:
+ 
+-  Team in possession (ball alive): the team of the most recent controlled on-ball event —
++  Team in possession (ball alive): the team of the most recent on-ball event —
+     PASS, CARRY, SHOT, SET PIECE, RECOVERY, and BALL LOST (the losing team still had the ball when
+     the loss began). CHALLENGE events are excluded: a duel is not control, and a contested ball
+     stays with the last team in control until a RECOVERY.
++  Controlled possession only: a new team's spell counts only if it shows control — a completed
++    pass (Metrica's PASS is always completed), a carry, a shot, a set piece, or keeping the ball
++    for >= 2 s of live play (CHALLENGE.md: "keeps the ball for a few seconds"). A ball won and
++    lost straight away is merged into the previous team's possession, as CHALLENGE.md says a
++    touch without control is not a change of possession.
+   Dead ball: from the moment play stops until the next restart event —
+     BALL OUT (at its end frame), a SHOT that goes out or scores, a foul (FAULT RECEIVED) that is
+     followed by a SET PIECE (otherwise advantage was played), and offside. Each half is also dead
+@@ -24,10 +29,12 @@ from __future__ import annotations
+ import numpy as np
+ import pandas as pd
+ 
+-from mtah import domain
++from mtah import domain, runs
+ 
+ _CONTROLLED_EVENT_TYPES = ("pass", "carry", "shot", "set piece", "recovery", "ball lost")
+ _RESTART_EVENT_TYPES = ("pass", "carry", "shot", "set piece", "recovery")
++_CONTROL_SHOWING_EVENT_TYPES = ("pass", "carry", "shot", "set piece")
++_MIN_CONTROLLED_SPELL_FRAMES = 2 * 25
+ 
+ 
+ def derive_possession_labels(events: pd.DataFrame, graded_halves: list[domain.GradedHalf],
+@@ -36,8 +43,9 @@ def derive_possession_labels(events: pd.DataFrame, graded_halves: list[domain.Gr
+     for graded_half in graded_halves:
+         half_events = events[events["period"] == graded_half.half]
+         half_start, half_end = graded_half.first_video_frame, graded_half.last_video_frame + 1
+-        team_per_frame = _team_of_latest_controlled_event(half_events, half_start, half_end)
+         is_dead = _dead_ball_from_events(half_events, half_start, half_end)
++        team_per_frame = _team_of_latest_controlled_event(half_events, half_start, half_end,
++                                                          is_dead)
+         labels[half_start:half_end] = np.where(
+             is_dead, domain.LABEL_DEAD,
+             np.where(team_per_frame == domain.HOME_TEAM, domain.LABEL_HOME, domain.LABEL_AWAY))
+@@ -45,17 +53,41 @@ def derive_possession_labels(events: pd.DataFrame, graded_halves: list[domain.Gr
+ 
+ 
+ def _team_of_latest_controlled_event(half_events: pd.DataFrame, half_start: int,
+-                                     half_end: int) -> domain.TeamCodePerFrame:
++                                     half_end: int,
++                                     is_dead: domain.BoolPerFrame) -> domain.TeamCodePerFrame:
+     """Frames before the first controlled event take that event's team: it is the kick-off
+     taker, and those frames are dead anyway."""
+     controlled = half_events[half_events["type"].isin(_CONTROLLED_EVENT_TYPES)]
+     event_starts = controlled["start_video_frame"].to_numpy()
+-    event_teams = controlled["team"].to_numpy(dtype=np.int8)
++    event_teams = _merge_spells_without_control(
++        event_starts, controlled["team"].to_numpy(dtype=np.int8),
++        controlled["type"].to_numpy(), half_start, half_end, is_dead)
+     frames = np.arange(half_start, half_end)
+     latest_event_index = np.searchsorted(event_starts, frames, side="right") - 1
+     return event_teams[np.maximum(latest_event_index, 0)]
+ 
+ 
++def _merge_spells_without_control(event_starts: np.ndarray, event_teams: domain.TeamCodePerFrame,
++                                  event_types: np.ndarray, half_start: int, half_end: int,
++                                  is_dead: domain.BoolPerFrame) -> domain.TeamCodePerFrame:
++    """A spell is a run of consecutive events by one team. Its length counts live frames only,
++    so a ball won just before it goes out of play does not count as kept."""
++    merged_teams = event_teams.copy()
++    spell_bounds = runs.equal_value_runs(event_teams)
++    spell_ends_frame = [int(event_starts[next_start]) for _, next_start, _ in spell_bounds[:-1]]
++    spell_ends_frame.append(half_end)
++    held_team = int(event_teams[0])
++    for (first_event, end_event, team), end_frame in zip(spell_bounds, spell_ends_frame):
++        start_frame = int(event_starts[first_event])
++        live_frames = int(np.sum(~is_dead[start_frame - half_start:end_frame - half_start]))
++        shows_control = (np.isin(event_types[first_event:end_event],
++                                 _CONTROL_SHOWING_EVENT_TYPES).any()
++                         or live_frames >= _MIN_CONTROLLED_SPELL_FRAMES)
++        held_team = team if shows_control else held_team
++        merged_teams[first_event:end_event] = held_team
++    return merged_teams
++
++
+ def _dead_ball_from_events(half_events: pd.DataFrame, half_start: int,
+                            half_end: int) -> domain.BoolPerFrame:
+     is_dead = np.zeros(half_end - half_start, dtype=bool)

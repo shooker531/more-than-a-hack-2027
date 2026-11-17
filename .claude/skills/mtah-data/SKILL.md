@@ -26,6 +26,11 @@ extracts thereof** to any third-party hosted or cloud-based LLM. That includes t
   names). Do not `cat`/`head` raw tracking rows, dump DataFrames of positions, print tag
   instances, or read frames of video into the conversation.
 - Code, docs, scores from `run_evaluation.py`, and the public repo files are fine to read.
+- Enforced in `.claude/settings.json`: the Read tool and common shell readers (cat, head, grep,
+  awk, ...) are denied on `data/tactical/`, `data/broadcast/` and the parsed `data/cache/BAR-ATH*`.
+  Pipeline scripts still read the data as normal Python programs, so the "aggregates only" rule
+  for what they print still matters. Public sample data (`data/external/`,
+  `data/cache/validation/`) is not restricted.
 - If a debugging step genuinely needs raw values, have the user look at them locally.
 
 ## 3. Files and where they live
@@ -46,13 +51,21 @@ data/tactical/   BAR-ATH_tactical{.mp4, _atd.xml, _atd.txt, _homography.csv, _sm
 data/broadcast/  BAR-ATH_broadcast{.mp4, _atd.xml, _atd.txt, _homography.csv}
 ```
 
-Local status: all non-video files present; **both .mp4 files are missing** (not needed for a
-submission).
+The video files are available locally but are not used by the pipeline.
 
-Environment: `.venv` (uv, Python 3.11) with `requirements-starter.txt` (numpy, pandas,
-kloppy==3.18.0, matplotlib, notebook). Run with `.venv/bin/python` or `source .venv/bin/activate`.
-Add packages with `uv pip install --python .venv <pkg>`. The scorer itself needs only
-numpy+pandas.
+Environment: `.venv` (uv, Python 3.11) with the pinned `requirements-mtah.txt` (numpy, pandas,
+scikit-learn, kloppy). Run with `.venv/bin/python` or `source .venv/bin/activate`. Add packages with
+`uv pip install --python .venv <pkg>` and pin them in `requirements-mtah.txt`. The scorer itself
+needs only numpy+pandas.
+
+### Public data about other matches (allowed by RULES.md)
+
+Downloaded by `scripts/download_public_data.sh` into `data/external/` (gitignored):
+- Metrica sample data (3 matches): no formal licence; acknowledge Metrica Sports for public use.
+- IDSSE / DFL open data (7 Bundesliga matches, 2022/23): CC-BY 4.0; credit the DFL and cite
+  Bassek et al. (2025), *Scientific Data* 12, 195, doi:10.1038/s41597-025-04505-y.
+- SkillCorner open data (A-League 2024/25): MIT licence, credit SkillCorner. Tested, not used.
+Anything used must stay publicly accessible to the organisers and be credited in the doc.
 
 ## 4. Frame alignment — the whole story
 
@@ -142,7 +155,7 @@ CSV `frame,h00..h22,reprojection_error,valid`, one row per video frame. Maps **n
 `unproject`, `pitch_corners`. Tactical: valid everywhere, median reprojection error 0.24 in play.
 Only useful together with the video.
 
-### 5d. Video (not present locally)
+### 5d. Video (available, not used by the pipeline)
 
 Tactical 1920×1080, 25 fps, 199,319 frames — the frame-index authority. If a decode gives a
 different count, the decode is wrong; don't pad/trim. Allowed for watching/debugging and for

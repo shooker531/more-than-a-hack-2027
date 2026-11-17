@@ -1,0 +1,664 @@
+diff --git a/README.md b/README.md
+index 2d30a8a..8e7637c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,59 @@
++# Our submission — possession labelling pipeline
++
++A learned possession model with Viterbi decoding, trained only on public matches from other
++competitions, plus rule-based dead-ball detection. The approach, every experiment (kept and
++rejected) and the numbers behind each decision are in [ITERATIONS.md](ITERATIONS.md); the
++technical document is `<team_name>.pdf`.
++
++## Reproduce the submission
++
++```bash
++# 1. Python environment (Python 3.11)
++uv venv --python 3.11 .venv
++uv pip install --python .venv -r requirements-mtah.txt
++
++# 2. Data
++#    a) the challenge bundle, unpacked into data/tactical/ (see data/README.md)
++#    b) the public training data (Metrica sample games + DFL open data, ~2.9 GB)
++bash scripts/download_public_data.sh
++
++# 3. Regenerate the submission (deterministic: same inputs, same bytes)
++.venv/bin/python run.py --output <team_name>.csv
++```
++
++`run.py` trains the model on the public matches, labels the challenge match, writes the CSV and
++runs the official validator. The first run parses and caches the public data (several minutes);
++later runs take under a minute.
++
++## Validate
++
++```bash
++.venv/bin/python run_validation.py               # leave-one-game-out on the 10 public matches
++.venv/bin/python scripts/compare_harness_realism.py   # simulated vs real tracking statistics
++```
++
++## Layout
++
++| Path | What it is |
++|---|---|
++| `run.py` | entry point: data → submission CSV |
++| `mtah/` | the pipeline: loading, features, dead-ball rules, model, Viterbi decoder |
++| `validation/` | public training/validation matches, their possession truth, tracking degradation |
++| `run_validation.py` | leave-one-game-out validation against the official scorer |
++| `ITERATIONS.md`, `experiments.csv` | experiment log; rejected experiments as `experiments/patches/` |
++
++## Data credits
++
++- Metrica Sports sample data — https://github.com/metrica-sports/sample-data
++- IDSSE / DFL open data, CC-BY 4.0, data owner Deutsche Fußball Liga (DFL). Bassek, M., Weber,
++  H., Rein, R. & Memmert, D. (2025). An integrated dataset of spatiotemporal and event data in
++  elite soccer. *Scientific Data*. https://doi.org/10.1038/s41597-025-04505-y
++
++No challenge match data is committed: `data/` is gitignored, and no labels of the challenge match
++are used for training or tuning.
++
++---
++
+ # More than a Hack 2027 — Phase 1: Ball Possession
+ 
+ **Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)
+diff --git a/mtah/config.py b/mtah/config.py
+index 3a11386..0318485 100644
+--- a/mtah/config.py
++++ b/mtah/config.py
+@@ -93,6 +93,10 @@ class PipelineConfig:
+     # Consecutive frames are near-duplicates; every 5th frame keeps the information at a fifth
+     # of the training cost.
+     model_training_frame_step: int = 5
++    # Each training game is degraded this many times with different noise, so the model learns to
++    # ignore tracking error rather than one particular pattern of it. Copies add no new football,
++    # so the benefit flattens quickly.
++    model_training_degraded_copies: int = 1
+     # Viterbi over H/A inside live play: the log-probability evidence for the other team must
+     # outweigh this cost before possession switches. Leave-one-game-out: 5 -> 0.620,
+     # 10 -> 0.635, 20 -> 0.642, 40 -> 0.643; 20 is where gains flatten.
+diff --git a/run.py b/run.py
+index 41c08e1..c18b42c 100644
+--- a/run.py
++++ b/run.py
+@@ -3,11 +3,12 @@
+     .venv/bin/python run.py                              # evaluation/results/mtah_mvp.csv
+     .venv/bin/python run.py --output path/to/team.csv
+ 
+-main() reads top to bottom: load the match -> train the possession model on the public sample
+-games -> label (mtah/pipeline.py lists the processing steps) -> write -> validate -> report.
++main() reads top to bottom: load the match -> train the possession model on the public labelled
++matches (Metrica samples + DFL open data) -> label (mtah/pipeline.py lists the processing steps)
++-> write -> validate -> report.
+ 
+-Prerequisite (once): git clone https://github.com/metrica-sports/sample-data
+-data/external/metrica-sample-data
++Prerequisites (once): the Metrica sample data in data/external/metrica-sample-data and the DFL
++open data in data/external/idsse — see README.
+ """
+ 
+ from __future__ import annotations
+@@ -18,12 +19,13 @@ import sys
+ 
+ import games
+ from mtah import config, load, pipeline, possession_model, write
+-from validation import sample_games, training_data
++from validation import labelled_games, training_data
+ 
+ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+ _DEFAULT_OUTPUT_PATH = os.path.join(_REPO_ROOT, "evaluation", "results", "mtah_mvp.csv")
+ _CACHE_DIR = os.path.join(games.DATA_DIR, "cache")
+ _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
++_DFL_DATA_DIR = os.path.join(games.DATA_DIR, "external", "idsse")
+ _SAMPLE_CACHE_DIR = os.path.join(games.DATA_DIR, "cache", "validation")
+ 
+ 
+@@ -33,10 +35,9 @@ def main(output_path: str, pipeline_config: config.PipelineConfig) -> None:
+     graded_halves = load.load_graded_halves(games.GAME)
+ 
+     training_examples = training_data.combine_training_examples([
+-        training_data.build_training_examples(
+-            sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR, _SAMPLE_CACHE_DIR),
+-            pipeline_config)
+-        for game_number in sample_games.SAMPLE_GAME_NUMBERS])
++        training_data.build_training_examples(game, pipeline_config)
++        for game in labelled_games.load_all_labelled_games(_SAMPLE_DATA_DIR, _DFL_DATA_DIR,
++                                                           _SAMPLE_CACHE_DIR)])
+     trained_model = possession_model.train_possession_model(
+         training_examples.feature_rows, training_examples.is_home_in_possession, pipeline_config)
+ 
+diff --git a/run_validation.py b/run_validation.py
+index f98db7f..32295b3 100644
+--- a/run_validation.py
++++ b/run_validation.py
+@@ -26,11 +26,12 @@ import numpy as np
+ 
+ import games
+ from mtah import config, pipeline, possession_model
+-from validation import (degrade, event_labels, reference_baseline, sample_games, scoring,
+-                        synthetic_tagging, training_data)
++from validation import (degrade, labelled_games, reference_baseline, scoring, synthetic_tagging,
++                        training_data)
+ 
+ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+ _SAMPLE_DATA_DIR = os.path.join(games.DATA_DIR, "external", "metrica-sample-data")
++_DFL_DATA_DIR = os.path.join(games.DATA_DIR, "external", "idsse")
+ _CACHE_DIR = os.path.join(games.DATA_DIR, "cache", "validation")
+ _RESULTS_PATH = os.path.join(_REPO_ROOT, "evaluation", "reports", "validation_latest.json")
+ # Degradation is random (player dropouts, noise, tag jitter); several seeds per game average
+@@ -40,34 +41,29 @@ _BOOTSTRAP_DRAWS = 1000
+ 
+ 
+ def main(pipeline_config: config.PipelineConfig) -> None:
+-    loaded_games = {game_number: sample_games.load_sample_game(game_number, _SAMPLE_DATA_DIR,
+-                                                               _CACHE_DIR)
+-                    for game_number in sample_games.SAMPLE_GAME_NUMBERS}
+-    examples_by_game = {game_number: training_data.build_training_examples(sample_game,
+-                                                                           pipeline_config)
+-                        for game_number, sample_game in loaded_games.items()}
++    validation_games = labelled_games.load_all_labelled_games(_SAMPLE_DATA_DIR, _DFL_DATA_DIR,
++                                                              _CACHE_DIR)
++    examples_by_game = {game.name: training_data.build_training_examples(game, pipeline_config)
++                        for game in validation_games}
+ 
+     truth_runs, pipeline_runs, baseline_runs, run_names = [], [], [], []
+-    for game_number, sample_game in loaded_games.items():
++    for game in validation_games:
+         held_out_training = training_data.combine_training_examples(
+             [examples for other_game, examples in examples_by_game.items()
+-             if other_game != game_number])
++             if other_game != game.name])
+         trained_model = possession_model.train_possession_model(
+             held_out_training.feature_rows, held_out_training.is_home_in_possession,
+             pipeline_config)
+-        truth = event_labels.derive_possession_labels(
+-            sample_game.events, sample_game.graded_halves, len(sample_game.tracking.ball_norm))
+         for seed in _DEGRADATION_SEEDS:
+-            degraded_tracking = degrade.degrade_tracking(
+-                sample_game.tracking, degrade.DEFAULT_DEGRADE_CONFIG, seed)
+-            tagging = synthetic_tagging.synthesize_set_piece_tags(
+-                sample_game.events, sample_game.graded_halves, seed)
++            degraded_tracking = degrade.degrade_labelled_game(game, degrade.DEFAULT_DEGRADE_CONFIG,
++                                                              seed)
++            tagging = synthetic_tagging.synthesize_restart_tags(game.truth, game.graded_halves,
++                                                                seed)
+             pipeline_runs.append(pipeline.label_possessions(
+-                degraded_tracking, tagging, sample_game.graded_halves, pipeline_config,
+-                trained_model))
++                degraded_tracking, tagging, game.graded_halves, pipeline_config, trained_model))
+             baseline_runs.append(reference_baseline.label_with_official_baseline(degraded_tracking))
+-            truth_runs.append(truth)
+-            run_names.append("game{}/seed{}".format(game_number, seed))
++            truth_runs.append(game.truth)
++            run_names.append("{}/seed{}".format(game.name, seed))
+ 
+     per_run_scores: list[dict[str, object]] = [
+         {"run": name,
+@@ -82,27 +78,38 @@ def main(pipeline_config: config.PipelineConfig) -> None:
+         "baseline": scoring.score_labels(pooled_truth, scoring.concatenate_label_runs(
+             baseline_runs), _BOOTSTRAP_DRAWS),
+     }
+-    _write_results(per_run_scores, pooled_scores)
+-    _print_report(per_run_scores, pooled_scores)
+-
+-
+-def _write_results(per_run_scores: list[dict[str, object]],
+-                   pooled_scores: dict[str, dict[str, float]]) -> None:
++    pooled_by_source = {
++        source: scoring.score_labels(
++            scoring.concatenate_label_runs([truth for name, truth in zip(run_names, truth_runs)
++                                            if name.startswith(source)]),
++            scoring.concatenate_label_runs([labels for name, labels
++                                            in zip(run_names, pipeline_runs)
++                                            if name.startswith(source)]), 0)
++        for source in ("metrica", "dfl")}
++    _write_results([game.name for game in validation_games], per_run_scores, pooled_scores,
++                   pooled_by_source)
++    _print_report(per_run_scores, pooled_scores, pooled_by_source)
++
++
++def _write_results(game_names: list[str], per_run_scores: list[dict[str, object]],
++                   pooled_scores: dict[str, dict[str, float]],
++                   pooled_by_source: dict[str, dict[str, float]]) -> None:
+     os.makedirs(os.path.dirname(_RESULTS_PATH), exist_ok=True)
+     with open(_RESULTS_PATH, "w") as handle:
+-        json.dump({"games": list(sample_games.SAMPLE_GAME_NUMBERS),
+-                   "seeds": list(_DEGRADATION_SEEDS),
+-                   "pooled": pooled_scores, "per_run": per_run_scores}, handle, indent=2)
++        json.dump({"games": game_names, "seeds": list(_DEGRADATION_SEEDS),
++                   "pooled": pooled_scores, "pooled_by_source": pooled_by_source,
++                   "per_run": per_run_scores}, handle, indent=2)
+ 
+ 
+ def _print_report(per_run_scores: list[dict[str, object]],
+-                  pooled_scores: dict[str, dict[str, float]]) -> None:
+-    print("{:<14} {:>10} {:>10} {:>10} {:>10} {:>12}".format(
++                  pooled_scores: dict[str, dict[str, float]],
++                  pooled_by_source: dict[str, dict[str, float]]) -> None:
++    print("{:<18} {:>10} {:>10} {:>10} {:>10} {:>12}".format(
+         "run", "spellF1", "base", "macroF1", "base", "poss pred/gt"))
+     for row in per_run_scores:
+         ours, theirs = row["pipeline"], row["baseline"]
+         assert isinstance(ours, dict) and isinstance(theirs, dict)
+-        print("{:<14} {:>10.3f} {:>10.3f} {:>10.3f} {:>10.3f} {:>7.0f}/{:<5.0f}".format(
++        print("{:<18} {:>10.3f} {:>10.3f} {:>10.3f} {:>10.3f} {:>7.0f}/{:<5.0f}".format(
+             str(row["run"]), ours["spell_f1"], theirs["spell_f1"], ours["macro_f1"],
+             theirs["macro_f1"], ours["predicted_possessions"], ours["true_possessions"]))
+     print()
+@@ -113,6 +120,10 @@ def _print_report(per_run_scores: list[dict[str, object]],
+                   scores["macro_f1"], scores["alive_dead_f1"],
+                   scores["team_accuracy_when_alive"], scores["predicted_possessions"],
+                   scores["true_possessions"]))
++    for source, scores in pooled_by_source.items():
++        print("  {:<8} spellF1 {:.3f}  possessions {:.0f}/{:.0f}".format(
++            source, scores["spell_f1"], scores["predicted_possessions"],
++            scores["true_possessions"]))
+     print("\nwrote", os.path.relpath(_RESULTS_PATH, _REPO_ROOT))
+ 
+ 
+diff --git a/validation/degrade.py b/validation/degrade.py
+index bc6fe92..dfbe9b9 100644
+--- a/validation/degrade.py
++++ b/validation/degrade.py
+@@ -1,6 +1,6 @@
+ """Make sample-game tracking look like the challenge's automatic tracking. Seeded, so repeatable.
+ 
+-Entry points: DegradeConfig, DEFAULT_DEGRADE_CONFIG, degrade_tracking.
++Entry points: DegradeConfig, DEFAULT_DEGRADE_CONFIG, degrade_labelled_game, degrade_tracking.
+ 
+ The ball is left as it is. Measured on the sample games, the ball is already missing on 32-41% of
+ frames (challenge: 41%), in ~160 gaps (challenge: 150), and the gaps line up with stoppages the
+@@ -19,7 +19,8 @@ import dataclasses
+ import numpy as np
+ from numpy.typing import NDArray
+ 
+-from mtah import config, domain
++from mtah import config, domain, runs
++from validation import labelled_games
+ 
+ 
+ @dataclasses.dataclass(frozen=True)
+@@ -47,6 +48,15 @@ class DegradeConfig:
+     # The real ball barely wobbles (|acceleration| p50 0.01 m/frame^2), so its error must curve
+     # gently: averaged twice over this window, not once.
+     ball_noise_smoothing_frames: int = 50
++    # Sources whose ball is tracked on every frame (DFL/TRACAB) lose it the way an optical
++    # tracker does, measured on the Metrica games: whole dead stretches lose it 96.8% of the time;
++    # in live play ~1.27 gaps per minute cover 8.8% of frames — half are a few frames (brief
++    # occlusions), half last seconds (heavy tail: 10% over 10 s).
++    dead_stretch_ball_lost_share: float = 0.97
++    live_ball_gaps_per_minute: float = 1.27
++    live_ball_gap_short_share: float = 0.5
++    live_ball_gap_long_median_s: float = 4.0
++    live_ball_gap_long_log_sd: float = 1.2
+     # Speeds are derived from positions over this centred window, as a tracker would smooth them.
+     speed_window_frames: int = 5
+ 
+@@ -54,6 +64,37 @@ class DegradeConfig:
+ DEFAULT_DEGRADE_CONFIG = DegradeConfig()
+ 
+ 
++def degrade_labelled_game(game: labelled_games.LabelledGame, degrade_config: DegradeConfig,
++                          seed: int) -> domain.TrackingData:
++    tracking = (_remove_ball_like_optical_tracker(game.tracking, game.truth, degrade_config,
++                                                  np.random.default_rng(seed + 5000))
++                if game.is_ball_always_tracked else game.tracking)
++    return degrade_tracking(tracking, degrade_config, seed)
++
++
++def _remove_ball_like_optical_tracker(tracking: domain.TrackingData,
++                                      truth: domain.LabelPerFrame, degrade_config: DegradeConfig,
++                                      random_generator: np.random.Generator
++                                      ) -> domain.TrackingData:
++    is_ball_lost = np.zeros(len(truth), dtype=bool)
++    for start, end in runs.true_runs(truth == domain.LABEL_DEAD):
++        is_ball_lost[start:end] = (random_generator.random()
++                                   < degrade_config.dead_stretch_ball_lost_share)
++    live_frames = np.flatnonzero((truth == domain.LABEL_HOME) | (truth == domain.LABEL_AWAY))
++    n_gaps = random_generator.poisson(degrade_config.live_ball_gaps_per_minute * len(live_frames)
++                                      / (60 * config.FRAMES_PER_SECOND))
++    for gap_start in random_generator.choice(live_frames, size=n_gaps, replace=False):
++        is_short = random_generator.random() < degrade_config.live_ball_gap_short_share
++        length = (int(random_generator.integers(1, 6)) if is_short
++                  else int(config.FRAMES_PER_SECOND * degrade_config.live_ball_gap_long_median_s
++                           * np.exp(random_generator.normal(0.0,
++                                                            degrade_config.live_ball_gap_long_log_sd))))
++        is_ball_lost[gap_start:gap_start + length] = True
++    ball_norm = tracking.ball_norm.copy()
++    ball_norm[is_ball_lost] = np.nan
++    return dataclasses.replace(tracking, ball_norm=ball_norm)
++
++
+ def degrade_tracking(clean_tracking: domain.TrackingData, degrade_config: DegradeConfig,
+                      seed: int) -> domain.TrackingData:
+     random_generator = np.random.default_rng(seed)
+diff --git a/validation/synthetic_tagging.py b/validation/synthetic_tagging.py
+index 14e0d40..71e08be 100644
+--- a/validation/synthetic_tagging.py
++++ b/validation/synthetic_tagging.py
+@@ -1,6 +1,7 @@
+ """Smart-Tagging-like set-piece tags for the sample games, synthesised from their events.
+ 
+-Entry point: synthesize_set_piece_tags.
++Entry points: synthesize_restart_tags (any source, from the truth), synthesize_set_piece_tags
++(Metrica events).
+ 
+ The pipeline reads only SET PIECES tags, so only those are produced, in the same columns as
+ mtah.load.load_tagging. They are made to share the real tags' imperfections, so validation does
+@@ -17,7 +18,7 @@ import numpy as np
+ import pandas as pd
+ from numpy.typing import NDArray
+ 
+-from mtah import config, domain
++from mtah import config, domain, runs
+ 
+ # Tag windows open ~3.5 s before the restart (starter/01_smart_tagging.ipynb), +/- 1.5 s jitter,
+ # and extend a little past it.
+@@ -25,6 +26,41 @@ _OPENING_OFFSET_FRAMES = round(3.5 * config.FRAMES_PER_SECOND)
+ _OPENING_JITTER_FRAMES = round(1.5 * config.FRAMES_PER_SECOND)
+ _TAG_LENGTH_AFTER_RESTART_FRAMES = round(1.5 * config.FRAMES_PER_SECOND)
+ _MISSED_SET_PIECE_SHARE = 0.10
++_TAGGED_RESTART_SHARE = 0.4
++_NO_TEAM_RESTART_SHARE = 0.45
++
++
++def synthesize_restart_tags(possession_truth: domain.LabelPerFrame,
++                            graded_halves: list[domain.GradedHalf], seed: int) -> pd.DataFrame:
++    """Set-piece tags from the restarts in the truth (dead -> live), usable for any source.
++    The real match has 59 set-piece tags for ~150 restarts, so only a share of restarts is tagged;
++    each half's kick-off always is. Tagged throw-ins carry no team (~45% of real set-piece tags),
++    so that share of kept tags gets NO_TEAM."""
++    random_generator = np.random.default_rng(seed + 2000)
++    rows = []
++    for graded_half in graded_halves:
++        half_start, half_end = graded_half.first_video_frame, graded_half.last_video_frame + 1
++        is_live = possession_truth[half_start:half_end] != domain.LABEL_DEAD
++        restarts = [half_start + start for start, _ in runs.true_runs(is_live)]
++        for index, restart in enumerate(restarts):
++            is_kick_off = index == 0
++            if not is_kick_off and random_generator.random() >= _TAGGED_RESTART_SHARE:
++                continue
++            jitter = int(random_generator.integers(-_OPENING_JITTER_FRAMES,
++                                                   _OPENING_JITTER_FRAMES + 1))
++            restart_team = (domain.HOME_TEAM if possession_truth[restart] == domain.LABEL_HOME
++                            else domain.AWAY_TEAM)
++            is_untagged_team = (not is_kick_off
++                                and random_generator.random() < _NO_TEAM_RESTART_SHARE)
++            rows.append({
++                "code": "set pieces",
++                "set_piece_type": "kick off (start)" if is_kick_off else "free kick",
++                "team": domain.NO_TEAM if is_untagged_team else restart_team,
++                "start_video_frame": max(half_start, restart - _OPENING_OFFSET_FRAMES + jitter),
++                "end_video_frame": restart + _TAG_LENGTH_AFTER_RESTART_FRAMES,
++            })
++    return pd.DataFrame(rows, columns=["code", "set_piece_type", "team", "start_video_frame",
++                                       "end_video_frame"]).astype({"team": np.int8})
+ 
+ 
+ def synthesize_set_piece_tags(events: pd.DataFrame, graded_halves: list[domain.GradedHalf],
+diff --git a/validation/training_data.py b/validation/training_data.py
+index fe0a5ed..ff91b55 100644
+--- a/validation/training_data.py
++++ b/validation/training_data.py
+@@ -1,11 +1,10 @@
+-"""Training examples for the possession model, built from the Metrica sample games.
++"""Training examples for the possession model, built from labelled public matches.
+ 
+-Entry points: TRAINING_DEGRADATION_SEED, TrainingExamples, build_training_examples,
+-combine_training_examples.
++Entry points: TrainingExamples, build_training_examples, combine_training_examples.
+ 
+ The tracking is degraded exactly as in validation, so the model learns from the same imperfect
+-signals it will see on the challenge's automatic tracking. Labels are the event-derived
+-controlled-possession truth, live frames only (dead ball is decided by the rule detector).
++signals it will see on the challenge's automatic tracking. Labels are the controlled-possession
++truth, live frames only (dead ball is decided by the rule detector).
+ """
+ 
+ from __future__ import annotations
+@@ -16,11 +15,10 @@ import numpy as np
+ from numpy.typing import NDArray
+ 
+ from mtah import config, domain, features, pipeline
+-from validation import degrade, event_labels, sample_games
++from validation import degrade, labelled_games
+ 
+-# Training always uses one fixed degradation; validation scores seeds 0-2 of games the model did
+-# not train on, so sharing seed 0 never leaks a scored game into training.
+-TRAINING_DEGRADATION_SEED = 0
++# Training copies use degradation seeds 0, 1, ...; validation scores seeds 0-2 of games the model
++# did not train on, so sharing seed numbers never leaks a scored game into training.
+ 
+ 
+ class TrainingExamples(NamedTuple):
+@@ -28,23 +26,27 @@ class TrainingExamples(NamedTuple):
+     is_home_in_possession: NDArray[np.bool_]
+ 
+ 
+-def build_training_examples(sample_game: sample_games.SampleGame,
++def build_training_examples(game: labelled_games.LabelledGame,
+                             pipeline_config: config.PipelineConfig) -> TrainingExamples:
+-    truth = event_labels.derive_possession_labels(sample_game.events, sample_game.graded_halves,
+-                                                  len(sample_game.tracking.ball_norm))
+-    degraded_tracking = degrade.degrade_tracking(sample_game.tracking,
+-                                                 degrade.DEFAULT_DEGRADE_CONFIG,
+-                                                 TRAINING_DEGRADATION_SEED)
+-    feature_matrix = pipeline.compute_model_inputs(
+-        degraded_tracking, features.compute_frame_features(degraded_tracking, pipeline_config),
+-        sample_game.graded_halves, pipeline_config)
+-    is_live = (truth == domain.LABEL_HOME) | (truth == domain.LABEL_AWAY)
++    is_live = (game.truth == domain.LABEL_HOME) | (game.truth == domain.LABEL_AWAY)
+     sampled_frames = np.flatnonzero(is_live)[::pipeline_config.model_training_frame_step]
+-    return TrainingExamples(feature_matrix[sampled_frames],
+-                            truth[sampled_frames] == domain.LABEL_HOME)
++    return combine_training_examples([
++        _examples_from_one_degraded_copy(game, sampled_frames, seed, pipeline_config)
++        for seed in range(pipeline_config.model_training_degraded_copies)])
+ 
+ 
+ def combine_training_examples(examples: list[TrainingExamples]) -> TrainingExamples:
+     return TrainingExamples(np.vstack([example.feature_rows for example in examples]),
+                             np.concatenate([example.is_home_in_possession
+                                             for example in examples]))
++
++
++def _examples_from_one_degraded_copy(game: labelled_games.LabelledGame,
++                                     sampled_frames: NDArray[np.int64], seed: int,
++                                     pipeline_config: config.PipelineConfig) -> TrainingExamples:
++    degraded_tracking = degrade.degrade_labelled_game(game, degrade.DEFAULT_DEGRADE_CONFIG, seed)
++    feature_matrix = pipeline.compute_model_inputs(
++        degraded_tracking, features.compute_frame_features(degraded_tracking, pipeline_config),
++        game.graded_halves, pipeline_config)
++    return TrainingExamples(feature_matrix[sampled_frames],
++                            game.truth[sampled_frames] == domain.LABEL_HOME)
+diff --git a/scripts/download_public_data.sh b/scripts/download_public_data.sh
+new file mode 100644
+index 0000000..30e8b77
+--- /dev/null
++++ b/scripts/download_public_data.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++# Download the two public datasets the possession model is trained on, into data/external/.
++#
++#   bash scripts/download_public_data.sh
++#
++# 1. Metrica Sports sample data (3 matches, tracking + events)
++#    https://github.com/metrica-sports/sample-data
++# 2. IDSSE / DFL open data (7 Bundesliga matches, TRACAB tracking + events), CC-BY 4.0,
++#    data owner Deutsche Fussball Liga. Bassek, Weber, Rein & Memmert (2025), "An integrated
++#    dataset of spatiotemporal and event data in elite soccer", Scientific Data,
++#    doi:10.1038/s41597-025-04505-y. Mirror: https://huggingface.co/datasets/pysport/idsse-data
++#
++# Downloads resume if interrupted (curl -C -), so re-running is safe. About 2.9 GB in total.
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++EXTERNAL="$REPO_ROOT/data/external"
++mkdir -p "$EXTERNAL/idsse"
++
++if [ ! -d "$EXTERNAL/metrica-sample-data/.git" ]; then
++  git clone --depth 1 https://github.com/metrica-sports/sample-data.git "$EXTERNAL/metrica-sample-data"
++fi
++
++IDSSE_BASE="https://huggingface.co/datasets/pysport/idsse-data/resolve/main"
++MATCHES="000001_DFL-MAT-J03WMX 000001_DFL-MAT-J03WN1 000002_DFL-MAT-J03WOH 000002_DFL-MAT-J03WOY
++000002_DFL-MAT-J03WPY 000002_DFL-MAT-J03WQQ 000002_DFL-MAT-J03WR9"
++for match in $MATCHES; do
++  for kind in DFL_02_01_matchinformation DFL_03_02_events_raw DFL_04_03_positions_raw_observed; do
++    file="${kind}_DFL-COM-${match}.xml"
++    curl -sSL -C - --retry 5 -o "$EXTERNAL/idsse/$file" "$IDSSE_BASE/$file?download=true"
++  done
++done
++echo "Public data ready in $EXTERNAL"
+diff --git a/validation/labelled_games.py b/validation/labelled_games.py
+new file mode 100644
+index 0000000..49007fc
+--- /dev/null
++++ b/validation/labelled_games.py
+@@ -0,0 +1,146 @@
++"""Matches with known possession, in one common form, for training and validating the model.
++
++Entry points: LabelledGame, DFL_MATCH_IDS, load_all_labelled_games, labelled_game_from_metrica,
++load_dfl_game.
++
++Two public sources, both other matches (allowed by RULES.md):
++  - Metrica sample games 1-3: truth derived from their human-annotated events
++    (validation/event_labels.py). The ball is already missing where an optical tracker loses it.
++  - DFL / IDSSE open data, 7 Bundesliga matches (Bassek et al. 2025, CC-BY 4.0, data owner
++    Deutsche Fussball Liga): TRACAB tracking at 25 Hz whose every ball frame carries
++    BallPossession (team) and BallStatus (alive / dead) — the same kind of "corrected tracking"
++    ownership the challenge's ground truth was built from. The ball is tracked on every frame,
++    so degradation must remove it the way the challenge's tracker does.
++
++DFL's BallPossession flips on almost every touch (37% of spells under 2 s, median 3.0 s, vs 12%
++and 7.6 s in the challenge's public window), so the same controlled-possession rule used for the
++Metrica truth is applied: a new team's spell only counts if it lasts >= 2 s of live play,
++otherwise it merges back into the previous team's possession.
++"""
++
++from __future__ import annotations
++
++import os
++import warnings
++from dataclasses import dataclass
++
++import numpy as np
++from kloppy import sportec
++
++from mtah import domain, runs
++from validation import event_labels, sample_games
++
++DFL_MATCH_IDS = ("J03WMX", "J03WN1", "J03WOH", "J03WOY", "J03WPY", "J03WQQ", "J03WR9")
++_DFL_COMPETITION_BY_MATCH = {"J03WMX": "000001", "J03WN1": "000001"}  # others: 2. Bundesliga
++_DFL_SECOND_DIVISION = "000002"
++_PITCH_LENGTH_M, _PITCH_WIDTH_M = 105.0, 68.0
++_MIN_CONTROLLED_SPELL_FRAMES = 2 * 25
++
++
++@dataclass(frozen=True)
++class LabelledGame:
++    """tracking is clean (before degradation); its speed channel is NaN — speeds are derived
++    after degradation. is_ball_always_tracked marks sources whose ball must be removed during
++    degradation to look like the challenge's automatic tracker."""
++    name: str
++    tracking: domain.TrackingData
++    truth: domain.LabelPerFrame
++    graded_halves: list[domain.GradedHalf]
++    is_ball_always_tracked: bool
++
++
++def load_all_labelled_games(sample_data_dir: str, dfl_data_dir: str,
++                            cache_dir: str) -> list[LabelledGame]:
++    """The fixed set used for training and validation: Metrica 1-3, then the 7 DFL matches.
++    All must be present; a missing download raises rather than silently training on fewer."""
++    metrica = [labelled_game_from_metrica(sample_games.load_sample_game(number, sample_data_dir,
++                                                                        cache_dir))
++               for number in sample_games.SAMPLE_GAME_NUMBERS]
++    return metrica + [load_dfl_game(match_id, dfl_data_dir, cache_dir)
++                      for match_id in DFL_MATCH_IDS]
++
++
++def labelled_game_from_metrica(sample_game: sample_games.SampleGame) -> LabelledGame:
++    truth = event_labels.derive_possession_labels(sample_game.events, sample_game.graded_halves,
++                                                  len(sample_game.tracking.ball_norm))
++    return LabelledGame(name="metrica{}".format(sample_game.game_number),
++                        tracking=sample_game.tracking, truth=truth,
++                        graded_halves=sample_game.graded_halves, is_ball_always_tracked=False)
++
++
++def load_dfl_game(match_id: str, dfl_data_dir: str, cache_dir: str) -> LabelledGame:
++    """kloppy takes ~2 minutes to parse one 400 MB positions file, so the result is cached."""
++    cache_path = os.path.join(cache_dir, "dfl_{}.npz".format(match_id))
++    if not os.path.isfile(cache_path):
++        _parse_and_cache_dfl_game(match_id, dfl_data_dir, cache_path)
++    with np.load(cache_path) as cached:
++        tracking = domain.TrackingData(ball_norm=cached["ball"], players_norm=cached["players"],
++                                       slot_team=cached["slot_team"],
++                                       pitch_length_m=_PITCH_LENGTH_M,
++                                       pitch_width_m=_PITCH_WIDTH_M)
++        graded_halves = [domain.GradedHalf(int(half), int(first), int(last))
++                         for half, first, last in cached["graded_halves"]]
++        truth = cached["truth"].astype("<U1")
++    return LabelledGame(name="dfl_{}".format(match_id), tracking=tracking, truth=truth,
++                        graded_halves=graded_halves, is_ball_always_tracked=True)
++
++
++def _parse_and_cache_dfl_game(match_id: str, dfl_data_dir: str, cache_path: str) -> None:
++    competition = _DFL_COMPETITION_BY_MATCH.get(match_id, _DFL_SECOND_DIVISION)
++    stem = "DFL-COM-{}_DFL-MAT-{}.xml".format(competition, match_id)
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")
++        dataset = sportec.load_tracking(
++            meta_data=os.path.join(dfl_data_dir, "DFL_02_01_matchinformation_" + stem),
++            raw_data=os.path.join(dfl_data_dir, "DFL_04_03_positions_raw_observed_" + stem),
++            only_alive=False, coordinates="metrica")
++        frame_table = dataset.to_df().reset_index(drop=True)
++
++    slot_columns, slot_team = [], []
++    for team_index, team in enumerate(dataset.metadata.teams):
++        for player in team.players:
++            if "{}_x".format(player.player_id) in frame_table.columns:
++                slot_columns.append(str(player.player_id))
++                slot_team.append(domain.HOME_TEAM if team_index == 0 else domain.AWAY_TEAM)
++    n_frames = len(frame_table)
++    players = np.full((n_frames, len(slot_columns), 3), np.nan, dtype=np.float32)
++    for slot, player_id in enumerate(slot_columns):
++        players[:, slot, 0] = frame_table[player_id + "_x"].to_numpy(dtype=np.float32)
++        players[:, slot, 1] = frame_table[player_id + "_y"].to_numpy(dtype=np.float32)
++    ball = np.full((n_frames, 3), np.nan, dtype=np.float32)
++    ball[:, 0] = frame_table["ball_x"].to_numpy(dtype=np.float32)
++    ball[:, 1] = frame_table["ball_y"].to_numpy(dtype=np.float32)
++
++    graded_halves = np.array([(int(period), int(rows.index.min()), int(rows.index.max()))
++                              for period, rows in frame_table.groupby("period_id")],
++                             dtype=np.int64)
++    home_team_id = str(dataset.metadata.teams[0].team_id)
++    is_alive = frame_table["ball_state"].astype(str).str.contains("alive").to_numpy()
++    is_home_owner = (frame_table["ball_owning_team_id"].astype(str) == home_team_id).to_numpy()
++    raw_team = np.where(is_home_owner, domain.HOME_TEAM, domain.AWAY_TEAM).astype(np.int8)
++    truth = np.full(n_frames, domain.LABEL_ABSTAIN, dtype="<U1")
++    for _, first, last in graded_halves:
++        half = slice(first, last + 1)
++        controlled_team = _merge_uncontrolled_spells(raw_team[half], is_alive[half])
++        truth[half] = np.where(~is_alive[half], domain.LABEL_DEAD,
++                               np.where(controlled_team == domain.HOME_TEAM, domain.LABEL_HOME,
++                                        domain.LABEL_AWAY))
++
++    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
++    np.savez(cache_path, ball=ball, players=players,
++             slot_team=np.array(slot_team, dtype=np.int8), graded_halves=graded_halves,
++             truth=truth)
++
++
++def _merge_uncontrolled_spells(raw_team: domain.TeamCodePerFrame,
++                               is_alive: domain.BoolPerFrame) -> domain.TeamCodePerFrame:
++    """A spell of a new team with fewer than 2 s of live play is a touch, not possession: it
++    takes the previous holder's team. Length counts live frames only, so a ball touched just
++    before it goes out does not count as kept."""
++    merged = raw_team.copy()
++    held_team = int(raw_team[0])
++    for spell_start, spell_end, team in runs.equal_value_runs(raw_team):
++        live_frames = int(np.sum(is_alive[spell_start:spell_end]))
++        held_team = team if live_frames >= _MIN_CONTROLLED_SPELL_FRAMES else held_team
++        merged[spell_start:spell_end] = held_team
++    return merged
